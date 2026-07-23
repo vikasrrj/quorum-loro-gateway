@@ -20,8 +20,9 @@ use tracing::error;
 use tracing::warn;
 
 use crate::frame::DeltaFrame;
+use crate::frame::FrameLimits;
 use crate::frame::ProducerTuple;
-use crate::frame::decode_all;
+use crate::frame::decode_all_with_limits;
 use crate::names::delta_stream;
 use crate::names::producer_id;
 use crate::ursula::AppendOutcome;
@@ -56,6 +57,7 @@ pub struct ActorConfig {
     pub command_capacity: usize,
     pub ambiguous_retries: usize,
     pub retry_delay: Duration,
+    pub frame_limits: FrameLimits,
 }
 
 impl Default for ActorConfig {
@@ -64,6 +66,7 @@ impl Default for ActorConfig {
             command_capacity: 128,
             ambiguous_retries: 5,
             retry_delay: Duration::from_millis(25),
+            frame_limits: FrameLimits::default(),
         }
     }
 }
@@ -247,7 +250,8 @@ impl RoomActor {
             .read_all(&self.stream)
             .await
             .map_err(|error| error.to_string())?;
-        let frames = decode_all(&bytes).map_err(|error| error.to_string())?;
+        let frames = decode_all_with_limits(&bytes, self.config.frame_limits)
+            .map_err(|error| error.to_string())?;
         let mut history = Vec::new();
         for frame in frames {
             validate_update_blobs(&frame.updates)?;
@@ -384,7 +388,7 @@ impl RoomActor {
             sequence: self.producer_sequence,
         };
         let frame = DeltaFrame::new(producer.clone(), batch_id, updates.clone());
-        let bytes = match frame.encode() {
+        let bytes = match frame.encode_with_limits(self.config.frame_limits) {
             Ok(bytes) => bytes,
             Err(error) => {
                 error!(room = %self.room_id, %error, "failed to encode update frame");
@@ -470,9 +474,9 @@ impl RoomActor {
                             "deduplicated tuple is bound to different frame bytes".into(),
                         ));
                     }
-                    let (stored_frame, consumed) = DeltaFrame::decode_one(&stored)
+                    let stored_frame = DeltaFrame::decode_exact(&stored, self.config.frame_limits)
                         .map_err(|error| StoreError::Integrity(error.to_string()))?;
-                    if consumed != stored.len() || stored_frame.producer != pending.producer {
+                    if stored_frame.producer != pending.producer {
                         return Err(StoreError::Integrity(
                             "deduplicated committed range has wrong producer tuple".into(),
                         ));

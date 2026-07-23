@@ -86,6 +86,29 @@ cargo run -- \
 
 ## Experiment Results
 
-Quorum durability, leader-failure, minority/quorum-loss, producer-state, and
-full-replay results will be recorded here only after their scripts and raw
-results have run successfully.
+### One-voter failure durability
+
+The real-process ignored test performs this sequence against disk-backed
+Ursula voters:
+
+1. Start three Ursula processes and a gateway process.
+2. Join with the official Loro protocol and wait for `Ack(Ok)`.
+3. SIGKILL voter 3.
+4. SIGKILL the gateway.
+5. Start a fresh gateway process with no local durable state against voter 2.
+6. Rejoin and reconstruct the acknowledged Loro update from the two survivors.
+
+This passed locally:
+
+```bash
+cargo test --test phase2_cluster \
+  acknowledged_update_survives_one_voter_and_gateway_crash \
+  -- --ignored --nocapture
+```
+
+This proves survival of one voter failure for an acknowledged update in the
+tested three-voter, disk-WAL topology. It does not claim recovery from two or
+three lost replicas.
+
+Leader-failure, quorum-loss, producer-state, and full-replay results remain
+pending and will be recorded only after their scripts and raw results run.

@@ -173,7 +173,23 @@ enum Command {
 
 struct PendingAppend {
     producer: ProducerTuple,
+    frame: DeltaFrame,
     bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableAppend {
+    Committed { next_offset: u64 },
+    VerifiedDuplicate { next_offset: u64 },
+}
+
+#[derive(Debug)]
+enum AppendFailure {
+    DefinitelyRejected {
+        kind: RejectionKind,
+        message: String,
+    },
+    OutcomeUnknown(StoreError),
 }
 
 struct RoomActor {
@@ -387,6 +403,11 @@ impl RoomActor {
             epoch: 0,
             sequence: self.producer_sequence,
         };
+        let Some(next_producer_sequence) = self.producer_sequence.checked_add(1) else {
+            error!(room = %self.room_id, "producer sequence exhausted");
+            send_ack(&peer, &self.room_id, batch_id, UpdateStatusCode::AppError);
+            return;
+        };
         let frame = DeltaFrame::new(producer.clone(), batch_id, updates.clone());
         let bytes = match frame.encode_with_limits(self.config.frame_limits) {
             Ok(bytes) => bytes,
@@ -403,12 +424,13 @@ impl RoomActor {
         };
         let pending = PendingAppend {
             producer: producer.clone(),
+            frame,
             bytes: bytes.clone(),
         };
 
         match self.resolve_append(&pending).await {
-            Ok(()) => {
-                self.producer_sequence = self.producer_sequence.saturating_add(1);
+            Ok(proof) => {
+                self.producer_sequence = next_producer_sequence;
                 self.history = candidate_history;
                 self.doc = candidate;
                 for (id, subscriber) in &self.peers {
@@ -424,9 +446,9 @@ impl RoomActor {
                         );
                     }
                 }
-                send_ack(&peer, &self.room_id, batch_id, UpdateStatusCode::Ok);
+                send_durable_ack(&peer, &self.room_id, batch_id, proof);
             }
-            Err(StoreError::Rejected { kind, message }) => {
+            Err(AppendFailure::DefinitelyRejected { kind, message }) => {
                 warn!(room = %self.room_id, ?kind, %message, "Ursula append rejected");
                 let status = match kind {
                     RejectionKind::PermissionDenied => UpdateStatusCode::PermissionDenied,
@@ -437,7 +459,7 @@ impl RoomActor {
                 };
                 send_ack(&peer, &self.room_id, batch_id, status);
             }
-            Err(error) => {
+            Err(AppendFailure::OutcomeUnknown(error)) => {
                 error!(room = %self.room_id, %error, "append remains unresolved");
                 self.blocked = Some(pending);
                 send_ack(&peer, &self.room_id, batch_id, UpdateStatusCode::Unknown);
@@ -446,7 +468,10 @@ impl RoomActor {
         }
     }
 
-    async fn resolve_append(&self, pending: &PendingAppend) -> Result<(), StoreError> {
+    async fn resolve_append(
+        &self,
+        pending: &PendingAppend,
+    ) -> Result<DurableAppend, AppendFailure> {
         let mut attempts = 0_usize;
         loop {
             match self
@@ -454,46 +479,76 @@ impl RoomActor {
                 .append(&self.stream, &pending.producer, &pending.bytes)
                 .await
             {
-                Ok(AppendOutcome::Committed { .. }) => return Ok(()),
+                Ok(AppendOutcome::Committed { next_offset }) => {
+                    return Ok(DurableAppend::Committed { next_offset });
+                }
                 Ok(AppendOutcome::Duplicate { next_offset }) => {
                     let frame_len = pending.bytes.len();
                     let frame_len_u64 = u64::try_from(frame_len).map_err(|_| {
-                        StoreError::Integrity("frame length does not fit u64".into())
+                        AppendFailure::OutcomeUnknown(StoreError::Integrity(
+                            "frame length does not fit u64".into(),
+                        ))
                     })?;
                     let start = next_offset.checked_sub(frame_len_u64).ok_or_else(|| {
-                        StoreError::Integrity(
+                        AppendFailure::OutcomeUnknown(StoreError::Integrity(
                             "duplicate next offset is smaller than retry frame".into(),
-                        )
+                        ))
                     })?;
                     let stored = self
                         .store
                         .read_range(&self.stream, start, frame_len)
-                        .await?;
-                    if stored != pending.bytes {
-                        return Err(StoreError::Integrity(
-                            "deduplicated tuple is bound to different frame bytes".into(),
-                        ));
-                    }
-                    let stored_frame = DeltaFrame::decode_exact(&stored, self.config.frame_limits)
-                        .map_err(|error| StoreError::Integrity(error.to_string()))?;
-                    if stored_frame.producer != pending.producer {
-                        return Err(StoreError::Integrity(
-                            "deduplicated committed range has wrong producer tuple".into(),
-                        ));
-                    }
-                    return Ok(());
+                        .await
+                        .map_err(AppendFailure::OutcomeUnknown)?;
+                    verify_duplicate_bytes(pending, &stored, self.config.frame_limits)
+                        .map_err(AppendFailure::OutcomeUnknown)?;
+                    return Ok(DurableAppend::VerifiedDuplicate { next_offset });
                 }
                 Err(error @ StoreError::Ambiguous(_)) => {
                     if attempts >= self.config.ambiguous_retries {
-                        return Err(error);
+                        return Err(AppendFailure::OutcomeUnknown(error));
                     }
                     attempts = attempts.saturating_add(1);
                     tokio::time::sleep(self.config.retry_delay).await;
                 }
-                Err(error) => return Err(error),
+                Err(StoreError::Rejected { kind, message }) => {
+                    return Err(AppendFailure::DefinitelyRejected { kind, message });
+                }
+                Err(error) => return Err(AppendFailure::OutcomeUnknown(error)),
             }
         }
     }
+}
+
+fn verify_duplicate_bytes(
+    pending: &PendingAppend,
+    stored: &[u8],
+    limits: FrameLimits,
+) -> Result<(), StoreError> {
+    if stored.len() != pending.bytes.len() {
+        return Err(StoreError::Integrity(format!(
+            "duplicate range length mismatch: expected {}, received {}",
+            pending.bytes.len(),
+            stored.len()
+        )));
+    }
+    if stored != pending.bytes {
+        return Err(StoreError::Integrity(
+            "deduplicated tuple is bound to different frame bytes".into(),
+        ));
+    }
+    let stored_frame = DeltaFrame::decode_exact(stored, limits)
+        .map_err(|error| StoreError::Integrity(error.to_string()))?;
+    if stored_frame.producer != pending.producer {
+        return Err(StoreError::Integrity(
+            "deduplicated committed range has wrong producer tuple".into(),
+        ));
+    }
+    if stored_frame != pending.frame {
+        return Err(StoreError::Integrity(
+            "deduplicated committed range has different frame fields".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_update_blobs(updates: &[Vec<u8>]) -> Result<(), String> {
@@ -532,6 +587,18 @@ fn send_ack(peer: &PeerSender, room_id: &str, batch_id: BatchId, status: UpdateS
             status,
         },
     );
+}
+
+fn send_durable_ack(peer: &PeerSender, room_id: &str, batch_id: BatchId, proof: DurableAppend) {
+    match proof {
+        DurableAppend::Committed { next_offset } => {
+            tracing::info!(room = %room_id, producer_next_offset = next_offset, resolution = "committed", "durable update acknowledged");
+        }
+        DurableAppend::VerifiedDuplicate { next_offset } => {
+            tracing::info!(room = %room_id, producer_next_offset = next_offset, resolution = "verified_duplicate", "durable update acknowledged");
+        }
+    }
+    send_ack(peer, room_id, batch_id, UpdateStatusCode::Ok);
 }
 
 fn send_room_error(peer: &PeerSender, room_id: &str, message: String) {

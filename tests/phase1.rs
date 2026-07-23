@@ -55,7 +55,10 @@ struct ProducerRecord {
 enum Behavior {
     Commit,
     Reject,
+    Ambiguous,
+    DuplicateAt(u64),
     CommitThenAmbiguous,
+    CommitCorruptThenAmbiguous,
     WaitFor(Arc<Notify>),
 }
 
@@ -197,6 +200,8 @@ impl UrsulaStore for MemoryStore {
                 kind: RejectionKind::Conflict,
                 message: "definite test rejection".into(),
             }),
+            Behavior::Ambiguous => Err(StoreError::Ambiguous("test outcome unknown".into())),
+            Behavior::DuplicateAt(next_offset) => Ok(AppendOutcome::Duplicate { next_offset }),
             Behavior::WaitFor(gate) => {
                 gate.notified().await;
                 let mut state = self.inner.lock().expect("memory store lock");
@@ -206,6 +211,18 @@ impl UrsulaStore for MemoryStore {
             Behavior::CommitThenAmbiguous => {
                 let mut state = self.inner.lock().expect("memory store lock");
                 let _ = Self::commit(&mut state, stream, producer, body)?;
+                Err(StoreError::Ambiguous("test response lost".into()))
+            }
+            Behavior::CommitCorruptThenAmbiguous => {
+                let mut state = self.inner.lock().expect("memory store lock");
+                let _ = Self::commit(&mut state, stream, producer, body)?;
+                if let Some(last) = state
+                    .streams
+                    .get_mut(stream)
+                    .and_then(|bytes| bytes.last_mut())
+                {
+                    *last ^= 1;
+                }
                 Err(StoreError::Ambiguous("test response lost".into()))
             }
             Behavior::Commit => {
@@ -321,6 +338,40 @@ async fn definite_rejection_never_returns_success_ack() {
 }
 
 #[tokio::test]
+async fn exhausted_ambiguity_never_returns_success_ack_or_advances_sequence() {
+    let store = MemoryStore::new();
+    for _ in 0..4 {
+        store.push_behavior(Behavior::Ambiguous);
+    }
+    let rooms = manager(store.clone(), 23);
+    let (room, tx, mut rx) = joined_room(&rooms, "outcome-unknown", 1).await;
+    room.update(
+        1,
+        BatchId([23; 8]),
+        vec![update_for("unknown", 23)],
+        tx.clone(),
+    )
+    .await;
+    assert_eq!(recv_ack(&mut rx).await, UpdateStatusCode::Unknown);
+    assert!(
+        store
+            .stream_bytes(&delta_stream("outcome-unknown").physical)
+            .is_empty()
+    );
+
+    room.update(1, BatchId([24; 8]), vec![update_for("blocked", 24)], tx)
+        .await;
+    assert_eq!(recv_ack(&mut rx).await, UpdateStatusCode::RateLimited);
+    let attempts = store.attempts();
+    assert_eq!(attempts.len(), 4);
+    assert!(
+        attempts
+            .iter()
+            .all(|attempt| attempt.producer.sequence == 0)
+    );
+}
+
+#[tokio::test]
 async fn lost_response_retries_identical_tuple_and_body() {
     let store = MemoryStore::new();
     store.push_behavior(Behavior::CommitThenAmbiguous);
@@ -339,6 +390,28 @@ async fn lost_response_retries_identical_tuple_and_body() {
             .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn duplicate_offset_underflow_never_returns_success_ack() {
+    let store = MemoryStore::new();
+    store.push_behavior(Behavior::DuplicateAt(0));
+    let rooms = manager(store, 25);
+    let (room, tx, mut rx) = joined_room(&rooms, "duplicate-underflow", 1).await;
+    room.update(1, BatchId([25; 8]), vec![update_for("underflow", 25)], tx)
+        .await;
+    assert_eq!(recv_ack(&mut rx).await, UpdateStatusCode::Unknown);
+}
+
+#[tokio::test]
+async fn duplicate_with_changed_stored_bytes_never_returns_success_ack() {
+    let store = MemoryStore::new();
+    store.push_behavior(Behavior::CommitCorruptThenAmbiguous);
+    let rooms = manager(store, 26);
+    let (room, tx, mut rx) = joined_room(&rooms, "duplicate-corrupt", 1).await;
+    room.update(1, BatchId([26; 8]), vec![update_for("corrupt", 26)], tx)
+        .await;
+    assert_eq!(recv_ack(&mut rx).await, UpdateStatusCode::Unknown);
 }
 
 #[tokio::test]

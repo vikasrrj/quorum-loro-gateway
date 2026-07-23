@@ -5,6 +5,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use loro::EncodedBlobMode;
 use loro::ExportMode;
 use loro::LoroDoc;
 use loro::VersionVector;
@@ -15,7 +16,9 @@ use loro_protocol::Permission;
 use loro_protocol::ProtocolMessage;
 use loro_protocol::RoomErrorCode;
 use loro_protocol::UpdateStatusCode;
+use serde::Serialize;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tracing::error;
 use tracing::warn;
 
@@ -39,6 +42,40 @@ pub enum Outbound {
 }
 
 pub type PeerSender = mpsc::UnboundedSender<Outbound>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomLifecycle {
+    Recovering,
+    Ready,
+    AppendAmbiguous,
+    Corrupt,
+    Unavailable,
+}
+
+impl RoomLifecycle {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Recovering => "recovering",
+            Self::Ready => "ready",
+            Self::AppendAmbiguous => "append_ambiguous",
+            Self::Corrupt => "corrupt",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RoomStatus {
+    pub stream: String,
+    pub state: RoomLifecycle,
+    pub producer_id: String,
+    pub producer_epoch: u64,
+    pub producer_sequence: u64,
+    pub pending_sequence: Option<u64>,
+    pub peer_count: usize,
+    pub last_error: Option<String>,
+}
 
 #[derive(Clone)]
 pub struct RoomManager {
@@ -97,22 +134,52 @@ impl RoomManager {
             return room.clone();
         }
         let (tx, rx) = mpsc::channel(self.inner.config.command_capacity);
-        let handle = RoomHandle { tx };
         let actor = RoomActor::new(
             room_id.to_owned(),
             self.inner.boot_id,
             self.inner.store.clone(),
             self.inner.config.clone(),
         );
+        let handle = RoomHandle {
+            tx,
+            status: actor.status.clone(),
+        };
         tokio::spawn(actor.run(rx));
         rooms.insert(room_id.to_owned(), handle.clone());
         handle
+    }
+
+    pub fn room_statuses(&self) -> Vec<RoomStatus> {
+        let rooms = self
+            .inner
+            .rooms
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut statuses = rooms.values().map(RoomHandle::status).collect::<Vec<_>>();
+        statuses.sort_by(|left, right| left.stream.cmp(&right.stream));
+        statuses
+    }
+
+    pub async fn retry_ambiguous(&self, room_id: &str) -> bool {
+        let room = {
+            let rooms = self
+                .inner
+                .rooms
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            rooms.get(room_id).cloned()
+        };
+        match room {
+            Some(room) => room.retry_ambiguous().await,
+            None => false,
+        }
     }
 }
 
 #[derive(Clone)]
 pub struct RoomHandle {
     tx: mpsc::Sender<Command>,
+    status: Arc<Mutex<RoomStatus>>,
 }
 
 impl RoomHandle {
@@ -152,6 +219,26 @@ impl RoomHandle {
     pub async fn leave(&self, connection_id: u64) {
         let _ = self.tx.send(Command::Leave { connection_id }).await;
     }
+
+    pub fn status(&self) -> RoomStatus {
+        self.status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub async fn retry_ambiguous(&self) -> bool {
+        let (response, result) = oneshot::channel();
+        if self
+            .tx
+            .send(Command::RetryAmbiguous { response })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        result.await.unwrap_or(false)
+    }
 }
 
 enum Command {
@@ -168,6 +255,9 @@ enum Command {
     },
     Leave {
         connection_id: u64,
+    },
+    RetryAmbiguous {
+        response: oneshot::Sender<bool>,
     },
 }
 
@@ -192,6 +282,12 @@ enum AppendFailure {
     OutcomeUnknown(StoreError),
 }
 
+#[derive(Debug)]
+struct InitializationFailure {
+    state: RoomLifecycle,
+    message: String,
+}
+
 struct RoomActor {
     room_id: String,
     stream: String,
@@ -202,6 +298,9 @@ struct RoomActor {
     history: Vec<Vec<u8>>,
     peers: HashMap<u64, PeerSender>,
     blocked: Option<PendingAppend>,
+    lifecycle: RoomLifecycle,
+    last_error: Option<String>,
+    status: Arc<Mutex<RoomStatus>>,
     config: ActorConfig,
 }
 
@@ -214,6 +313,16 @@ impl RoomActor {
     ) -> Self {
         let stream = delta_stream(&room_id).physical;
         let producer_id = producer_id(&boot_id, &room_id);
+        let status = Arc::new(Mutex::new(RoomStatus {
+            stream: stream.clone(),
+            state: RoomLifecycle::Recovering,
+            producer_id: producer_id.clone(),
+            producer_epoch: 0,
+            producer_sequence: 0,
+            pending_sequence: None,
+            peer_count: 0,
+            last_error: None,
+        }));
         Self {
             room_id,
             stream,
@@ -224,18 +333,33 @@ impl RoomActor {
             history: Vec::new(),
             peers: HashMap::new(),
             blocked: None,
+            lifecycle: RoomLifecycle::Recovering,
+            last_error: None,
+            status,
             config,
         }
     }
 
     async fn run(mut self, mut rx: mpsc::Receiver<Command>) {
-        let initialization = self.initialize().await;
+        match self.initialize().await {
+            Ok(()) => self.transition(RoomLifecycle::Ready, None),
+            Err(failure) => self.transition(failure.state, Some(failure.message)),
+        }
         while let Some(command) = rx.recv().await {
-            if let Err(message) = &initialization {
-                self.reject_unavailable(command, message);
-                continue;
-            }
             match command {
+                Command::RetryAmbiguous { response } => {
+                    let _ = response.send(self.retry_pending().await);
+                }
+                command
+                    if matches!(
+                        self.lifecycle,
+                        RoomLifecycle::Recovering
+                            | RoomLifecycle::Corrupt
+                            | RoomLifecycle::Unavailable
+                    ) =>
+                {
+                    self.reject_unavailable(command);
+                }
                 Command::Join {
                     connection_id,
                     version,
@@ -251,35 +375,57 @@ impl RoomActor {
                 }
                 Command::Leave { connection_id } => {
                     self.peers.remove(&connection_id);
+                    self.publish_status();
                 }
             }
         }
     }
 
-    async fn initialize(&mut self) -> Result<(), String> {
+    async fn initialize(&mut self) -> Result<(), InitializationFailure> {
         self.store
             .ensure_stream(&self.stream)
             .await
-            .map_err(|error| error.to_string())?;
-        let bytes = self
-            .store
-            .read_all(&self.stream)
-            .await
-            .map_err(|error| error.to_string())?;
-        let frames = decode_all_with_limits(&bytes, self.config.frame_limits)
-            .map_err(|error| error.to_string())?;
-        let mut history = Vec::new();
-        for frame in frames {
-            validate_update_blobs(&frame.updates)?;
-            history.extend(frame.updates);
-        }
-        let doc = replay(&history)?;
+            .map_err(initialization_store_failure)?;
+        let (history, doc) = self.load_from_store().await?;
         self.history = history;
         self.doc = doc;
         Ok(())
     }
 
-    fn reject_unavailable(&self, command: Command, message: &str) {
+    async fn load_from_store(&self) -> Result<(Vec<Vec<u8>>, LoroDoc), InitializationFailure> {
+        let bytes = self
+            .store
+            .read_all(&self.stream)
+            .await
+            .map_err(initialization_store_failure)?;
+        let frames = decode_all_with_limits(&bytes, self.config.frame_limits).map_err(|error| {
+            InitializationFailure {
+                state: RoomLifecycle::Corrupt,
+                message: error.to_string(),
+            }
+        })?;
+        let mut history = Vec::new();
+        for frame in frames {
+            validate_update_blobs(&frame.updates, history.is_empty()).map_err(|message| {
+                InitializationFailure {
+                    state: RoomLifecycle::Corrupt,
+                    message,
+                }
+            })?;
+            history.extend(frame.updates);
+        }
+        let doc = replay(&history).map_err(|message| InitializationFailure {
+            state: RoomLifecycle::Corrupt,
+            message,
+        })?;
+        Ok((history, doc))
+    }
+
+    fn reject_unavailable(&self, command: Command) {
+        let message = self
+            .last_error
+            .as_deref()
+            .unwrap_or_else(|| self.lifecycle.as_str());
         match command {
             Command::Join { peer, .. } => {
                 send_protocol(
@@ -290,7 +436,7 @@ impl RoomActor {
                         code: JoinErrorCode::AppError,
                         message: message.to_owned(),
                         receiver_version: None,
-                        app_code: Some("storage_unavailable".into()),
+                        app_code: Some(self.lifecycle.as_str().into()),
                     },
                 );
             }
@@ -298,10 +444,59 @@ impl RoomActor {
                 send_ack(&peer, &self.room_id, batch_id, UpdateStatusCode::Unknown);
             }
             Command::Leave { .. } => {}
+            Command::RetryAmbiguous { response } => {
+                let _ = response.send(false);
+            }
         }
     }
 
+    fn transition(&mut self, state: RoomLifecycle, last_error: Option<String>) {
+        let previous = self.lifecycle;
+        self.lifecycle = state;
+        self.last_error = last_error;
+        self.publish_status();
+        tracing::info!(
+            stream = %self.stream,
+            producer_id = %self.producer_id,
+            producer_epoch = 0_u64,
+            producer_sequence = self.producer_sequence,
+            pending_sequence = self.blocked.as_ref().map(|pending| pending.producer.sequence),
+            from = previous.as_str(),
+            to = state.as_str(),
+            "room lifecycle transition"
+        );
+    }
+
+    fn publish_status(&self) {
+        let mut status = self
+            .status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        status.state = self.lifecycle;
+        status.producer_sequence = self.producer_sequence;
+        status.pending_sequence = self
+            .blocked
+            .as_ref()
+            .map(|pending| pending.producer.sequence);
+        status.peer_count = self.peers.len();
+        status.last_error.clone_from(&self.last_error);
+    }
+
     fn join(&mut self, connection_id: u64, version: Vec<u8>, peer: PeerSender) {
+        if self.lifecycle != RoomLifecycle::Ready {
+            send_protocol(
+                &peer,
+                ProtocolMessage::JoinError {
+                    crdt: CrdtType::Loro,
+                    room_id: self.room_id.clone(),
+                    code: JoinErrorCode::AppError,
+                    message: "room state is not authoritative".into(),
+                    receiver_version: None,
+                    app_code: Some(self.lifecycle.as_str().into()),
+                },
+            );
+            return;
+        }
         let client_version = if version.is_empty() {
             None
         } else {
@@ -324,6 +519,7 @@ impl RoomActor {
             }
         };
         self.peers.insert(connection_id, peer.clone());
+        self.publish_status();
         send_protocol(
             &peer,
             ProtocolMessage::JoinResponseOk {
@@ -363,7 +559,7 @@ impl RoomActor {
             );
             return;
         }
-        if self.blocked.is_some() {
+        if self.lifecycle != RoomLifecycle::Ready || self.blocked.is_some() {
             send_ack(
                 &peer,
                 &self.room_id,
@@ -372,7 +568,7 @@ impl RoomActor {
             );
             return;
         }
-        if let Err(error) = validate_update_blobs(&updates) {
+        if let Err(error) = validate_update_blobs(&updates, self.history.is_empty()) {
             warn!(room = %self.room_id, %error, "invalid Loro update rejected");
             send_ack(
                 &peer,
@@ -433,6 +629,7 @@ impl RoomActor {
                 self.producer_sequence = next_producer_sequence;
                 self.history = candidate_history;
                 self.doc = candidate;
+                self.transition(RoomLifecycle::Ready, None);
                 for (id, subscriber) in &self.peers {
                     if *id != connection_id {
                         for update in &updates {
@@ -455,9 +652,66 @@ impl RoomActor {
             }
             Err(AppendFailure::OutcomeUnknown(error)) => {
                 error!(room = %self.room_id, %error, "append remains unresolved");
+                let message = error.to_string();
                 self.blocked = Some(pending);
+                self.transition(RoomLifecycle::AppendAmbiguous, Some(message.clone()));
                 send_ack(&peer, &self.room_id, batch_id, UpdateStatusCode::Unknown);
-                send_room_error(&peer, &self.room_id, error.to_string());
+                send_room_error(&peer, &self.room_id, message);
+            }
+        }
+    }
+
+    async fn retry_pending(&mut self) -> bool {
+        let Some(pending) = self.blocked.take() else {
+            return false;
+        };
+        self.publish_status();
+        match self.resolve_append(&pending).await {
+            Ok(proof) => match self.load_from_store().await {
+                Ok((history, doc)) => {
+                    let Some(next_sequence) = pending.producer.sequence.checked_add(1) else {
+                        self.blocked = Some(pending);
+                        self.transition(
+                            RoomLifecycle::Unavailable,
+                            Some("producer sequence exhausted during reconciliation".into()),
+                        );
+                        return false;
+                    };
+                    self.producer_sequence = next_sequence;
+                    self.history = history;
+                    self.doc = doc;
+                    tracing::info!(
+                        stream = %self.stream,
+                        producer_id = %pending.producer.id,
+                        producer_epoch = pending.producer.epoch,
+                        producer_sequence = pending.producer.sequence,
+                        ?proof,
+                        reconciliation = "reloaded_from_ursula",
+                        "ambiguous append reconciled"
+                    );
+                    self.transition(RoomLifecycle::Ready, None);
+                    true
+                }
+                Err(failure) => {
+                    self.blocked = Some(pending);
+                    self.transition(failure.state, Some(failure.message));
+                    false
+                }
+            },
+            Err(AppendFailure::DefinitelyRejected { kind, message }) => {
+                self.blocked = Some(pending);
+                self.transition(
+                    RoomLifecycle::Unavailable,
+                    Some(format!(
+                        "ambiguous append retry was definitely rejected ({kind:?}): {message}"
+                    )),
+                );
+                false
+            }
+            Err(AppendFailure::OutcomeUnknown(error)) => {
+                self.blocked = Some(pending);
+                self.transition(RoomLifecycle::AppendAmbiguous, Some(error.to_string()));
+                false
             }
         }
     }
@@ -468,12 +722,31 @@ impl RoomActor {
     ) -> Result<DurableAppend, AppendFailure> {
         let mut attempts = 0_usize;
         loop {
+            tracing::info!(
+                stream = %self.stream,
+                producer_id = %pending.producer.id,
+                producer_epoch = pending.producer.epoch,
+                producer_sequence = pending.producer.sequence,
+                retry = attempts,
+                frame_bytes = pending.bytes.len(),
+                "submitting Ursula append"
+            );
             match self
                 .store
                 .append(&self.stream, &pending.producer, &pending.bytes)
                 .await
             {
                 Ok(AppendOutcome::Committed { next_offset }) => {
+                    tracing::info!(
+                        stream = %self.stream,
+                        producer_id = %pending.producer.id,
+                        producer_epoch = pending.producer.epoch,
+                        producer_sequence = pending.producer.sequence,
+                        retry = attempts,
+                        outcome = "committed",
+                        next_offset,
+                        "Ursula append resolved"
+                    );
                     return Ok(DurableAppend::Committed { next_offset });
                 }
                 Ok(AppendOutcome::Duplicate { next_offset }) => {
@@ -488,6 +761,17 @@ impl RoomActor {
                             "duplicate next offset is smaller than retry frame".into(),
                         ))
                     })?;
+                    tracing::info!(
+                        stream = %self.stream,
+                        producer_id = %pending.producer.id,
+                        producer_epoch = pending.producer.epoch,
+                        producer_sequence = pending.producer.sequence,
+                        retry = attempts,
+                        outcome = "duplicate",
+                        range_start = start,
+                        range_end = next_offset,
+                        "verifying deduplicated append range"
+                    );
                     let stored = self
                         .store
                         .read_range(&self.stream, start, frame_len)
@@ -495,6 +779,18 @@ impl RoomActor {
                         .map_err(AppendFailure::OutcomeUnknown)?;
                     verify_duplicate_bytes(pending, &stored, self.config.frame_limits)
                         .map_err(AppendFailure::OutcomeUnknown)?;
+                    tracing::info!(
+                        stream = %self.stream,
+                        producer_id = %pending.producer.id,
+                        producer_epoch = pending.producer.epoch,
+                        producer_sequence = pending.producer.sequence,
+                        retry = attempts,
+                        outcome = "verified_duplicate",
+                        range_start = start,
+                        range_end = next_offset,
+                        reconciliation = "exact_frame_match",
+                        "Ursula append resolved"
+                    );
                     return Ok(DurableAppend::VerifiedDuplicate { next_offset });
                 }
                 Err(error @ StoreError::Ambiguous(_)) => {
@@ -545,7 +841,19 @@ fn verify_duplicate_bytes(
     Ok(())
 }
 
-fn validate_update_blobs(updates: &[Vec<u8>]) -> Result<(), String> {
+fn initialization_store_failure(error: StoreError) -> InitializationFailure {
+    let state = if matches!(error, StoreError::Integrity(_)) {
+        RoomLifecycle::Corrupt
+    } else {
+        RoomLifecycle::Unavailable
+    };
+    InitializationFailure {
+        state,
+        message: error.to_string(),
+    }
+}
+
+fn validate_update_blobs(updates: &[Vec<u8>], allow_snapshot: bool) -> Result<(), String> {
     if updates.is_empty() {
         return Err("DocUpdate contains no updates".into());
     }
@@ -553,7 +861,23 @@ fn validate_update_blobs(updates: &[Vec<u8>]) -> Result<(), String> {
         if update.is_empty() {
             return Err("DocUpdate contains an empty update".into());
         }
-        LoroDoc::decode_import_blob_meta(update, true).map_err(|error| error.to_string())?;
+        let metadata =
+            LoroDoc::decode_import_blob_meta(update, true).map_err(|error| error.to_string())?;
+        match metadata.mode {
+            EncodedBlobMode::Snapshot if allow_snapshot && updates.len() == 1 => {}
+            EncodedBlobMode::Snapshot => {
+                return Err(
+                    "full snapshots are accepted only as the sole blob in an empty room".into(),
+                );
+            }
+            EncodedBlobMode::Updates => {}
+            EncodedBlobMode::ShallowSnapshot => {
+                return Err("shallow snapshots are not supported in Phase 1".into());
+            }
+            EncodedBlobMode::OutdatedSnapshot | EncodedBlobMode::OutdatedRle => {
+                return Err("outdated Loro encodings are not supported in Phase 1".into());
+            }
+        }
     }
     Ok(())
 }

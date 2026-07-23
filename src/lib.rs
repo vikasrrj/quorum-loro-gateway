@@ -10,7 +10,9 @@ pub mod protocol;
 pub mod server;
 pub mod ursula;
 
+pub use actor::RoomLifecycle;
 pub use actor::RoomManager;
+pub use actor::RoomStatus;
 pub use server::ServerConfig;
 pub use server::app;
 pub use server::app_with_config;

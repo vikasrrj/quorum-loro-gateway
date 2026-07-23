@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
+use axum::Json;
 use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::Message;
@@ -68,7 +69,17 @@ pub fn app_with_config(rooms: RoomManager, config: ServerConfig) -> Router {
     Router::new()
         .route("/", get(upgrade))
         .route("/ws", get(upgrade))
+        .route("/healthz", get(health))
+        .route("/debug/rooms", get(debug_rooms))
         .with_state(AppState { rooms, config })
+}
+
+async fn health() -> &'static str {
+    "ok"
+}
+
+async fn debug_rooms(State(state): State<AppState>) -> Json<Vec<crate::actor::RoomStatus>> {
+    Json(state.rooms.room_statuses())
 }
 
 async fn upgrade(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {

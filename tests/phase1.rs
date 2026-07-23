@@ -16,6 +16,7 @@ use loro_protocol::ProtocolMessage;
 use loro_protocol::UpdateStatusCode;
 use quorum_loro_gateway::HttpUrsula;
 use quorum_loro_gateway::HttpUrsulaConfig;
+use quorum_loro_gateway::RoomLifecycle;
 use quorum_loro_gateway::RoomManager;
 use quorum_loro_gateway::ServerConfig;
 use quorum_loro_gateway::actor::ActorConfig;
@@ -46,6 +47,7 @@ struct MemoryState {
     producers: HashMap<(String, String), ProducerRecord>,
     behaviors: VecDeque<Behavior>,
     attempts: Vec<Attempt>,
+    unavailable: bool,
 }
 
 #[derive(Clone)]
@@ -61,6 +63,7 @@ enum Behavior {
     DuplicateAt(u64),
     CommitThenAmbiguous,
     CommitCorruptThenAmbiguous,
+    CommitThenReadsUnavailable,
     WaitFor(Arc<Notify>),
 }
 
@@ -104,6 +107,18 @@ impl MemoryStore {
             .unwrap_or_default()
     }
 
+    fn set_stream_bytes(&self, stream: &str, bytes: Vec<u8>) {
+        self.inner
+            .lock()
+            .expect("memory store lock")
+            .streams
+            .insert(stream.into(), bytes);
+    }
+
+    fn set_unavailable(&self, unavailable: bool) {
+        self.inner.lock().expect("memory store lock").unavailable = unavailable;
+    }
+
     fn commit(
         state: &mut MemoryState,
         stream: &str,
@@ -128,16 +143,18 @@ impl MemoryStore {
 #[async_trait]
 impl UrsulaStore for MemoryStore {
     async fn ensure_stream(&self, stream: &str) -> Result<(), StoreError> {
-        self.inner
-            .lock()
-            .expect("memory store lock")
-            .streams
-            .entry(stream.to_owned())
-            .or_default();
+        let mut state = self.inner.lock().expect("memory store lock");
+        if state.unavailable {
+            return Err(StoreError::Ambiguous("test store unavailable".into()));
+        }
+        state.streams.entry(stream.to_owned()).or_default();
         Ok(())
     }
 
     async fn read_all(&self, stream: &str) -> Result<Vec<u8>, StoreError> {
+        if self.inner.lock().expect("memory store lock").unavailable {
+            return Err(StoreError::Ambiguous("test store unavailable".into()));
+        }
         Ok(self.stream_bytes(stream))
     }
 
@@ -226,6 +243,12 @@ impl UrsulaStore for MemoryStore {
                     *last ^= 1;
                 }
                 Err(StoreError::Ambiguous("test response lost".into()))
+            }
+            Behavior::CommitThenReadsUnavailable => {
+                let mut state = self.inner.lock().expect("memory store lock");
+                let next_offset = Self::commit(&mut state, stream, producer, body)?;
+                state.unavailable = true;
+                Ok(AppendOutcome::Committed { next_offset })
             }
             Behavior::Commit => {
                 let mut state = self.inner.lock().expect("memory store lock");
@@ -374,6 +397,64 @@ async fn exhausted_ambiguity_never_returns_success_ack_or_advances_sequence() {
 }
 
 #[tokio::test]
+async fn ambiguous_room_rejects_joins_and_reconciles_from_ursula() {
+    let store = MemoryStore::new();
+    for _ in 0..4 {
+        store.push_behavior(Behavior::Ambiguous);
+    }
+    store.push_behavior(Behavior::CommitThenReadsUnavailable);
+    let rooms = manager(store.clone(), 29);
+    let (room, tx, mut rx) = joined_room(&rooms, "reconcile", 1).await;
+    room.update(
+        1,
+        BatchId([40; 8]),
+        vec![update_for("durable", 401)],
+        tx.clone(),
+    )
+    .await;
+    assert_eq!(recv_ack(&mut rx).await, UpdateStatusCode::Unknown);
+    assert_eq!(room.status().state, RoomLifecycle::AppendAmbiguous);
+    assert_eq!(room.status().pending_sequence, Some(0));
+
+    let (joining, mut joining_rx) = mpsc::unbounded_channel();
+    room.join(2, Vec::new(), joining).await;
+    assert!(matches!(
+        recv_protocol(&mut joining_rx).await,
+        ProtocolMessage::JoinError {
+            app_code: Some(code),
+            ..
+        } if code == "append_ambiguous"
+    ));
+
+    assert!(!room.retry_ambiguous().await);
+    assert_eq!(room.status().state, RoomLifecycle::Unavailable);
+    assert!(
+        !store
+            .stream_bytes(&delta_stream("reconcile").physical)
+            .is_empty()
+    );
+
+    store.set_unavailable(false);
+    assert!(room.retry_ambiguous().await);
+    assert_eq!(room.status().state, RoomLifecycle::Ready);
+    assert_eq!(room.status().producer_sequence, 1);
+    assert_eq!(room.status().pending_sequence, None);
+
+    room.update(1, BatchId([41; 8]), vec![update_for("next", 402)], tx)
+        .await;
+    assert_eq!(recv_ack(&mut rx).await, UpdateStatusCode::Ok);
+    assert_eq!(
+        store
+            .attempts()
+            .last()
+            .expect("last append")
+            .producer
+            .sequence,
+        1
+    );
+}
+
+#[tokio::test]
 async fn lost_response_retries_identical_tuple_and_body() {
     let store = MemoryStore::new();
     store.push_behavior(Behavior::CommitThenAmbiguous);
@@ -445,6 +526,127 @@ async fn official_empty_receiver_snapshot_is_accepted() {
     let (room, tx, mut rx) = joined_room(&rooms, "snapshot-upload", 1).await;
     room.update(1, BatchId([40; 8]), vec![snapshot], tx).await;
     assert_eq!(recv_ack(&mut rx).await, UpdateStatusCode::Ok);
+}
+
+#[tokio::test]
+async fn snapshot_replacement_and_shallow_snapshot_are_rejected_before_storage() {
+    let store = MemoryStore::new();
+    let rooms = manager(store.clone(), 30);
+    let (room, tx, mut rx) = joined_room(&rooms, "snapshot-policy", 1).await;
+    room.update(
+        1,
+        BatchId([42; 8]),
+        vec![update_for("existing", 403)],
+        tx.clone(),
+    )
+    .await;
+    assert_eq!(recv_ack(&mut rx).await, UpdateStatusCode::Ok);
+
+    let source = LoroDoc::new();
+    source.set_peer_id(404).expect("set snapshot peer");
+    source
+        .get_text("text")
+        .insert(0, "replacement")
+        .expect("insert replacement text");
+    source.commit();
+    let snapshot = source.export(ExportMode::Snapshot).expect("full snapshot");
+    room.update(1, BatchId([43; 8]), vec![snapshot], tx.clone())
+        .await;
+    assert_eq!(recv_ack(&mut rx).await, UpdateStatusCode::InvalidUpdate);
+    assert_eq!(store.attempts().len(), 1);
+
+    let shallow = source
+        .export(ExportMode::shallow_snapshot(&source.oplog_frontiers()))
+        .expect("shallow snapshot");
+    let empty_rooms = manager(store.clone(), 31);
+    let (empty, empty_tx, mut empty_rx) = joined_room(&empty_rooms, "shallow-policy", 1).await;
+    empty
+        .update(1, BatchId([44; 8]), vec![shallow], empty_tx)
+        .await;
+    assert_eq!(
+        recv_ack(&mut empty_rx).await,
+        UpdateStatusCode::InvalidUpdate
+    );
+    assert_eq!(store.attempts().len(), 1);
+}
+
+#[tokio::test]
+async fn corrupt_and_unavailable_rooms_are_visible_and_fail_closed() {
+    let corrupt_store = MemoryStore::new();
+    let corrupt_stream = delta_stream("corrupt-room").physical;
+    corrupt_store.set_stream_bytes(&corrupt_stream, b"trailing junk".to_vec());
+    let corrupt_rooms = manager(corrupt_store, 32);
+    let corrupt = corrupt_rooms.room("corrupt-room");
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    corrupt.join(1, Vec::new(), tx).await;
+    assert!(matches!(
+        recv_protocol(&mut rx).await,
+        ProtocolMessage::JoinError {
+            app_code: Some(code),
+            ..
+        } if code == "corrupt"
+    ));
+    assert_eq!(corrupt.status().state, RoomLifecycle::Corrupt);
+    assert!(
+        corrupt
+            .status()
+            .last_error
+            .is_some_and(|error| error.contains("stream offset 0"))
+    );
+
+    let unavailable_store = MemoryStore::new();
+    unavailable_store.set_unavailable(true);
+    let unavailable_rooms = manager(unavailable_store, 33);
+    let unavailable = unavailable_rooms.room("unavailable-room");
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    unavailable.join(1, Vec::new(), tx).await;
+    assert!(matches!(
+        recv_protocol(&mut rx).await,
+        ProtocolMessage::JoinError {
+            app_code: Some(code),
+            ..
+        } if code == "unavailable"
+    ));
+    assert_eq!(unavailable.status().state, RoomLifecycle::Unavailable);
+}
+
+#[tokio::test]
+async fn health_and_debug_endpoints_expose_state_without_document_payloads() {
+    let store = MemoryStore::new();
+    let rooms = manager(store, 34);
+    let (room, tx, mut rx) = joined_room(&rooms, "debug-room", 1).await;
+    room.update(
+        1,
+        BatchId([45; 8]),
+        vec![update_for("secret-document-marker", 405)],
+        tx,
+    )
+    .await;
+    assert_eq!(recv_ack(&mut rx).await, UpdateStatusCode::Ok);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind debug gateway");
+    let address = listener.local_addr().expect("debug gateway address");
+    let server = tokio::spawn(axum::serve(listener, app(rooms)).into_future());
+    let health = reqwest::get(format!("http://{address}/healthz"))
+        .await
+        .expect("request health")
+        .text()
+        .await
+        .expect("read health");
+    assert_eq!(health, "ok");
+    let debug = reqwest::get(format!("http://{address}/debug/rooms"))
+        .await
+        .expect("request debug rooms")
+        .text()
+        .await
+        .expect("read debug rooms");
+    assert!(debug.contains("\"state\":\"ready\""));
+    assert!(debug.contains("\"producer_sequence\":1"));
+    assert!(debug.contains(&delta_stream("debug-room").physical));
+    assert!(!debug.contains("secret-document-marker"));
+    server.abort();
 }
 
 #[tokio::test]

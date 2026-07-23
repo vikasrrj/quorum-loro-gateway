@@ -435,15 +435,9 @@ impl RoomActor {
                 self.doc = candidate;
                 for (id, subscriber) in &self.peers {
                     if *id != connection_id {
-                        send_protocol(
-                            subscriber,
-                            ProtocolMessage::DocUpdate {
-                                crdt: CrdtType::Loro,
-                                room_id: self.room_id.clone(),
-                                updates: updates.clone(),
-                                batch_id: server_batch_id(),
-                            },
-                        );
+                        for update in &updates {
+                            send_update(subscriber, &self.room_id, update.clone());
+                        }
                     }
                 }
                 send_durable_ack(&peer, &self.room_id, batch_id, proof);

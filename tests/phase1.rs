@@ -17,9 +17,11 @@ use loro_protocol::UpdateStatusCode;
 use quorum_loro_gateway::HttpUrsula;
 use quorum_loro_gateway::HttpUrsulaConfig;
 use quorum_loro_gateway::RoomManager;
+use quorum_loro_gateway::ServerConfig;
 use quorum_loro_gateway::actor::ActorConfig;
 use quorum_loro_gateway::actor::Outbound;
 use quorum_loro_gateway::app;
+use quorum_loro_gateway::app_with_config;
 use quorum_loro_gateway::frame::ProducerTuple;
 use quorum_loro_gateway::frame::decode_all;
 use quorum_loro_gateway::names::delta_stream;
@@ -616,11 +618,61 @@ async fn next_ws_protocol(
     }
 }
 
+async fn send_ws_protocol(client: &mut ProtocolClient, message: ProtocolMessage) {
+    client
+        .ws
+        .send(Message::Binary(
+            loro_protocol::encode(&message)
+                .expect("encode test protocol message")
+                .into(),
+        ))
+        .await
+        .expect("send test protocol message");
+}
+
+async fn configured_gateway(
+    store: MemoryStore,
+    config: ServerConfig,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind configured gateway");
+    let address = listener.local_addr().expect("configured gateway address");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app_with_config(manager(store, 27), config)).await;
+    });
+    (format!("ws://{address}/ws"), server)
+}
+
 fn doc_updates(message: ProtocolMessage) -> Result<Vec<Vec<u8>>, String> {
     if let ProtocolMessage::DocUpdate { updates, .. } = message {
         Ok(updates)
     } else {
         Err(format!("expected DocUpdate, received {message:?}"))
+    }
+}
+
+fn fragment_header(message: ProtocolMessage) -> Result<(u64, u64), String> {
+    if let ProtocolMessage::DocUpdateFragmentHeader {
+        fragment_count,
+        total_size_bytes,
+        ..
+    } = message
+    {
+        Ok((fragment_count, total_size_bytes))
+    } else {
+        Err(format!("expected fragment header, received {message:?}"))
+    }
+}
+
+fn fragment(message: ProtocolMessage) -> Result<(u64, Vec<u8>), String> {
+    if let ProtocolMessage::DocUpdateFragment {
+        index, fragment, ..
+    } = message
+    {
+        Ok((index, fragment))
+    } else {
+        Err(format!("expected fragment, received {message:?}"))
     }
 }
 
@@ -647,6 +699,222 @@ async fn two_official_protocol_clients_converge() {
         second.doc.get_text("text").to_string()
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn fragment_limits_conflicts_and_timeout_fail_closed() {
+    let config = ServerConfig {
+        max_fragment_batches: 2,
+        max_fragment_bytes_per_connection: 5,
+        fragment_timeout: Duration::from_millis(500),
+        ..ServerConfig::default()
+    };
+    let (url, server) = configured_gateway(MemoryStore::new(), config).await;
+    let mut client = ProtocolClient::connect(&url, "fragment-limits", 300).await;
+
+    send_ws_protocol(
+        &mut client,
+        ProtocolMessage::DocUpdateFragmentHeader {
+            crdt: CrdtType::Loro,
+            room_id: "fragment-limits".into(),
+            batch_id: BatchId([31; 8]),
+            fragment_count: 2,
+            total_size_bytes: 4,
+        },
+    )
+    .await;
+    send_ws_protocol(
+        &mut client,
+        ProtocolMessage::DocUpdateFragmentHeader {
+            crdt: CrdtType::Loro,
+            room_id: "fragment-limits".into(),
+            batch_id: BatchId([32; 8]),
+            fragment_count: 1,
+            total_size_bytes: 2,
+        },
+    )
+    .await;
+    assert!(matches!(
+        next_ws_protocol(&mut client.ws).await,
+        ProtocolMessage::Ack {
+            status: UpdateStatusCode::PayloadTooLarge,
+            ref_id,
+            ..
+        } if ref_id == BatchId([32; 8])
+    ));
+
+    send_ws_protocol(
+        &mut client,
+        ProtocolMessage::DocUpdateFragmentHeader {
+            crdt: CrdtType::Loro,
+            room_id: "fragment-limits".into(),
+            batch_id: BatchId([31; 8]),
+            fragment_count: 3,
+            total_size_bytes: 4,
+        },
+    )
+    .await;
+    assert!(matches!(
+        next_ws_protocol(&mut client.ws).await,
+        ProtocolMessage::Ack {
+            status: UpdateStatusCode::InvalidUpdate,
+            ref_id,
+            ..
+        } if ref_id == BatchId([31; 8])
+    ));
+
+    send_ws_protocol(
+        &mut client,
+        ProtocolMessage::DocUpdateFragmentHeader {
+            crdt: CrdtType::Loro,
+            room_id: "fragment-limits".into(),
+            batch_id: BatchId([33; 8]),
+            fragment_count: 2,
+            total_size_bytes: 2,
+        },
+    )
+    .await;
+    assert!(matches!(
+        next_ws_protocol(&mut client.ws).await,
+        ProtocolMessage::Ack {
+            status: UpdateStatusCode::FragmentTimeout,
+            ref_id,
+            ..
+        } if ref_id == BatchId([33; 8])
+    ));
+
+    for (batch, total_size_bytes) in [(37, 2), (38, 2), (39, 1)] {
+        send_ws_protocol(
+            &mut client,
+            ProtocolMessage::DocUpdateFragmentHeader {
+                crdt: CrdtType::Loro,
+                room_id: "fragment-limits".into(),
+                batch_id: BatchId([batch; 8]),
+                fragment_count: 1,
+                total_size_bytes,
+            },
+        )
+        .await;
+    }
+    assert!(matches!(
+        next_ws_protocol(&mut client.ws).await,
+        ProtocolMessage::Ack {
+            status: UpdateStatusCode::RateLimited,
+            ref_id,
+            ..
+        } if ref_id == BatchId([39; 8])
+    ));
+    server.abort();
+}
+
+#[tokio::test]
+async fn fragments_reassemble_out_of_order_and_reject_conflicting_duplicates() {
+    let (url, server) = configured_gateway(MemoryStore::new(), ServerConfig::default()).await;
+    let mut client = ProtocolClient::connect(&url, "fragment-order", 301).await;
+    let update = update_for("fragmented", 301);
+    let split = update.len() / 2;
+
+    send_ws_protocol(
+        &mut client,
+        ProtocolMessage::DocUpdateFragmentHeader {
+            crdt: CrdtType::Loro,
+            room_id: "fragment-order".into(),
+            batch_id: BatchId([34; 8]),
+            fragment_count: 2,
+            total_size_bytes: update.len() as u64,
+        },
+    )
+    .await;
+    for (index, fragment) in [(1, update[split..].to_vec()), (0, update[..split].to_vec())] {
+        send_ws_protocol(
+            &mut client,
+            ProtocolMessage::DocUpdateFragment {
+                crdt: CrdtType::Loro,
+                room_id: "fragment-order".into(),
+                batch_id: BatchId([34; 8]),
+                index,
+                fragment,
+            },
+        )
+        .await;
+    }
+    assert!(matches!(
+        next_ws_protocol(&mut client.ws).await,
+        ProtocolMessage::Ack {
+            status: UpdateStatusCode::Ok,
+            ref_id,
+            ..
+        } if ref_id == BatchId([34; 8])
+    ));
+
+    send_ws_protocol(
+        &mut client,
+        ProtocolMessage::DocUpdateFragmentHeader {
+            crdt: CrdtType::Loro,
+            room_id: "fragment-order".into(),
+            batch_id: BatchId([35; 8]),
+            fragment_count: 2,
+            total_size_bytes: 2,
+        },
+    )
+    .await;
+    for fragment in [b"a".to_vec(), b"b".to_vec()] {
+        send_ws_protocol(
+            &mut client,
+            ProtocolMessage::DocUpdateFragment {
+                crdt: CrdtType::Loro,
+                room_id: "fragment-order".into(),
+                batch_id: BatchId([35; 8]),
+                index: 0,
+                fragment,
+            },
+        )
+        .await;
+    }
+    assert!(matches!(
+        next_ws_protocol(&mut client.ws).await,
+        ProtocolMessage::Ack {
+            status: UpdateStatusCode::InvalidUpdate,
+            ref_id,
+            ..
+        } if ref_id == BatchId([35; 8])
+    ));
+    server.abort();
+}
+
+#[tokio::test]
+async fn oversized_committed_live_update_is_fragmented_for_subscribers() {
+    let mut value = 0x1234_5678_u64;
+    let text = (0..600_000)
+        .map(|_| {
+            value = value
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            char::from(32 + ((value >> 32) % 95) as u8)
+        })
+        .collect::<String>();
+    let update = update_for(&text, 302);
+    assert!(update.len() > loro_protocol::MAX_MESSAGE_SIZE);
+
+    let store = MemoryStore::new();
+    let rooms = manager(store, 28);
+    let (room, first_tx, mut first_rx) = joined_room(&rooms, "large-live", 1).await;
+    let (_same_room, _second_tx, mut second_rx) = joined_room(&rooms, "large-live", 2).await;
+    room.update(1, BatchId([36; 8]), vec![update.clone()], first_tx)
+        .await;
+
+    let (fragment_count, total_size) =
+        fragment_header(recv_protocol(&mut second_rx).await).expect("fragment header");
+    let mut reconstructed = Vec::new();
+    for expected_index in 0..fragment_count {
+        let (index, bytes) =
+            fragment(recv_protocol(&mut second_rx).await).expect("update fragment");
+        assert_eq!(index, expected_index);
+        reconstructed.extend_from_slice(&bytes);
+    }
+    assert_eq!(reconstructed.len() as u64, total_size);
+    assert_eq!(reconstructed, update);
+    assert_eq!(recv_ack(&mut first_rx).await, UpdateStatusCode::Ok);
 }
 
 #[tokio::test]

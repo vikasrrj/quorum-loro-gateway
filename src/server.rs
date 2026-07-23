@@ -19,7 +19,6 @@ use loro_protocol::CrdtType;
 use loro_protocol::JoinErrorCode;
 use loro_protocol::ProtocolMessage;
 use loro_protocol::UpdateStatusCode;
-use loro_protocol::decode;
 use loro_protocol::encode;
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -27,30 +26,63 @@ use tracing::warn;
 use crate::actor::Outbound;
 use crate::actor::PeerSender;
 use crate::actor::RoomManager;
+use crate::protocol::ProtocolLimits;
+use crate::protocol::decode_bounded;
 
-const MAX_FRAGMENTS: u64 = 4096;
-const MAX_REASSEMBLED_BYTES: u64 = 32 * 1024 * 1024;
-const FRAGMENT_TIMEOUT: Duration = Duration::from_secs(10);
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    pub protocol_limits: ProtocolLimits,
+    pub max_fragment_batches: usize,
+    pub max_fragments_per_batch: u64,
+    pub max_reassembled_bytes: u64,
+    pub max_fragment_bytes_per_connection: u64,
+    pub fragment_timeout: Duration,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            protocol_limits: ProtocolLimits::default(),
+            max_fragment_batches: 8,
+            max_fragments_per_batch: 4096,
+            max_reassembled_bytes: 32 * 1024 * 1024,
+            max_fragment_bytes_per_connection: 64 * 1024 * 1024,
+            fragment_timeout: Duration::from_secs(10),
+        }
+    }
+}
 
 static CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 struct AppState {
     rooms: RoomManager,
+    config: ServerConfig,
 }
 
 pub fn app(rooms: RoomManager) -> Router {
+    app_with_config(rooms, ServerConfig::default())
+}
+
+pub fn app_with_config(rooms: RoomManager, config: ServerConfig) -> Router {
     Router::new()
         .route("/", get(upgrade))
         .route("/ws", get(upgrade))
-        .with_state(AppState { rooms })
+        .with_state(AppState { rooms, config })
 }
 
 async fn upgrade(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(move |socket| connection(socket, state.rooms))
+    let wire_limit = state
+        .config
+        .protocol_limits
+        .max_message_bytes
+        .min(loro_protocol::MAX_MESSAGE_SIZE);
+    ws.max_message_size(wire_limit)
+        .max_frame_size(wire_limit)
+        .on_upgrade(move |socket| connection(socket, state.rooms, state.config))
 }
 
-async fn connection(socket: WebSocket, rooms: RoomManager) {
+async fn connection(socket: WebSocket, rooms: RoomManager, config: ServerConfig) {
     let connection_id = CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
     let (mut sink, mut source) = socket.split();
     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Outbound>();
@@ -74,9 +106,13 @@ async fn connection(socket: WebSocket, rooms: RoomManager) {
 
     let mut joined = HashSet::new();
     let mut fragments = HashMap::<FragmentKey, FragmentBatch>::new();
+    let fragment_poll_interval = config
+        .fragment_timeout
+        .min(Duration::from_secs(1))
+        .max(Duration::from_millis(1));
     loop {
         expire_fragments(&mut fragments, &outbound_tx);
-        let result = match tokio::time::timeout(Duration::from_secs(1), source.next()).await {
+        let result = match tokio::time::timeout(fragment_poll_interval, source.next()).await {
             Ok(Some(result)) => result,
             Ok(None) => break,
             Err(_) => continue,
@@ -87,10 +123,7 @@ async fn connection(socket: WebSocket, rooms: RoomManager) {
             }
             Ok(Message::Text(_)) => {}
             Ok(Message::Binary(bytes)) => {
-                if bytes.len() > loro_protocol::MAX_MESSAGE_SIZE {
-                    continue;
-                }
-                let message = match decode(&bytes) {
+                let message = match decode_bounded(&bytes, config.protocol_limits) {
                     Ok(message) => message,
                     Err(error) => {
                         warn!(%error, "invalid Loro protocol message");
@@ -103,6 +136,7 @@ async fn connection(socket: WebSocket, rooms: RoomManager) {
                     &outbound_tx,
                     &mut joined,
                     &mut fragments,
+                    &config,
                     message,
                 )
                 .await;
@@ -118,6 +152,7 @@ async fn connection(socket: WebSocket, rooms: RoomManager) {
     for room_id in joined {
         rooms.room(&room_id).leave(connection_id).await;
     }
+    fragments.clear();
     drop(outbound_tx);
     let _ = writer.await;
 }
@@ -128,6 +163,7 @@ async fn handle_message(
     outbound: &PeerSender,
     joined: &mut HashSet<String>,
     fragments: &mut HashMap<FragmentKey, FragmentBatch>,
+    config: &ServerConfig,
     message: ProtocolMessage,
 ) {
     match message {
@@ -196,9 +232,9 @@ async fn handle_message(
                 return;
             }
             if fragment_count == 0
-                || fragment_count > MAX_FRAGMENTS
+                || fragment_count > config.max_fragments_per_batch
                 || total_size_bytes == 0
-                || total_size_bytes > MAX_REASSEMBLED_BYTES
+                || total_size_bytes > config.max_reassembled_bytes
             {
                 send_ack(
                     outbound,
@@ -210,6 +246,48 @@ async fn handle_message(
                 return;
             }
             let key = FragmentKey { room_id, batch_id };
+            if let Some(existing) = fragments.get(&key) {
+                if existing.total_size == total_size_bytes
+                    && u64::try_from(existing.chunks.len()).ok() == Some(fragment_count)
+                {
+                    return;
+                }
+                fragments.remove(&key);
+                send_ack(
+                    outbound,
+                    crdt,
+                    key.room_id,
+                    key.batch_id,
+                    UpdateStatusCode::InvalidUpdate,
+                );
+                return;
+            }
+            if fragments.len() >= config.max_fragment_batches {
+                send_ack(
+                    outbound,
+                    crdt,
+                    key.room_id,
+                    key.batch_id,
+                    UpdateStatusCode::RateLimited,
+                );
+                return;
+            }
+            let reserved_bytes = fragments
+                .values()
+                .try_fold(0_u64, |sum, batch| sum.checked_add(batch.total_size));
+            if reserved_bytes
+                .and_then(|bytes| bytes.checked_add(total_size_bytes))
+                .is_none_or(|bytes| bytes > config.max_fragment_bytes_per_connection)
+            {
+                send_ack(
+                    outbound,
+                    crdt,
+                    key.room_id,
+                    key.batch_id,
+                    UpdateStatusCode::PayloadTooLarge,
+                );
+                return;
+            }
             let count = match usize::try_from(fragment_count) {
                 Ok(count) => count,
                 Err(_) => return,
@@ -221,8 +299,7 @@ async fn handle_message(
                     chunks: vec![None; count],
                     received: 0,
                     received_bytes: 0,
-                    deadline: Instant::now() + FRAGMENT_TIMEOUT,
-                    outbound: outbound.clone(),
+                    deadline: Instant::now() + config.fragment_timeout,
                 },
             );
         }
@@ -233,6 +310,16 @@ async fn handle_message(
             index,
             fragment,
         } => {
+            if crdt != CrdtType::Loro || !joined.contains(&room_id) {
+                send_ack(
+                    outbound,
+                    crdt,
+                    room_id,
+                    batch_id,
+                    UpdateStatusCode::PermissionDenied,
+                );
+                return;
+            }
             let key = FragmentKey {
                 room_id: room_id.clone(),
                 batch_id,
@@ -274,7 +361,19 @@ async fn handle_message(
                     return;
                 }
             };
-            if batch.chunks[index].is_none() {
+            if let Some(existing) = &batch.chunks[index] {
+                if existing != &fragment {
+                    fragments.remove(&key);
+                    send_ack(
+                        outbound,
+                        crdt,
+                        room_id,
+                        batch_id,
+                        UpdateStatusCode::InvalidUpdate,
+                    );
+                }
+                return;
+            } else {
                 let Some(received_bytes) = batch.received_bytes.checked_add(fragment_len) else {
                     fragments.remove(&key);
                     send_ack(
@@ -331,6 +430,7 @@ async fn handle_message(
         ProtocolMessage::Leave { crdt, room_id } => {
             if crdt == CrdtType::Loro && joined.remove(&room_id) {
                 rooms.room(&room_id).leave(connection_id).await;
+                fragments.retain(|key, _| key.room_id != room_id);
             }
         }
         ProtocolMessage::Ack { .. } => {
@@ -356,7 +456,6 @@ struct FragmentBatch {
     received: usize,
     received_bytes: u64,
     deadline: Instant,
-    outbound: PeerSender,
 }
 
 fn expire_fragments(fragments: &mut HashMap<FragmentKey, FragmentBatch>, outbound: &PeerSender) {
@@ -367,14 +466,9 @@ fn expire_fragments(fragments: &mut HashMap<FragmentKey, FragmentBatch>, outboun
         .map(|(key, _)| key.clone())
         .collect::<Vec<_>>();
     for key in expired {
-        if let Some(batch) = fragments.remove(&key) {
-            let target = if batch.outbound.is_closed() {
-                outbound
-            } else {
-                &batch.outbound
-            };
+        if fragments.remove(&key).is_some() {
             send_ack(
-                target,
+                outbound,
                 CrdtType::Loro,
                 key.room_id,
                 key.batch_id,

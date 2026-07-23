@@ -626,6 +626,8 @@ impl RoomActor {
 
         match self.resolve_append(&pending).await {
             Ok(proof) => {
+                #[cfg(feature = "crash-injection")]
+                crash_after_commit_for_test();
                 self.producer_sequence = next_producer_sequence;
                 self.history = candidate_history;
                 self.doc = candidate;
@@ -977,4 +979,11 @@ fn server_batch_id() -> BatchId {
             .fetch_add(1, Ordering::Relaxed)
             .to_be_bytes(),
     )
+}
+
+#[cfg(feature = "crash-injection")]
+fn crash_after_commit_for_test() {
+    if std::env::var_os("QLG_TEST_CRASH_AFTER_COMMIT").is_some() {
+        std::process::abort();
+    }
 }

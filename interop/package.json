@@ -1,0 +1,12 @@
+{
+  "name": "quorum-loro-gateway-interop",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node client.mjs"
+  },
+  "dependencies": {
+    "loro-crdt": "1.13.7",
+    "loro-protocol": "0.3.0"
+  }
+}

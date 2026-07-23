@@ -904,6 +904,34 @@ async fn two_official_protocol_clients_converge() {
 }
 
 #[tokio::test]
+#[ignore = "requires `npm ci --prefix interop` and Node.js 18+"]
+async fn official_typescript_clients_converge() {
+    let store = MemoryStore::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind TypeScript gateway");
+    let address = listener.local_addr().expect("TypeScript gateway address");
+    let server = tokio::spawn(axum::serve(listener, app(manager(store, 35))).into_future());
+    let url = format!("ws://{address}/ws");
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("node")
+            .arg(format!("{}/interop/client.mjs", env!("CARGO_MANIFEST_DIR")))
+            .arg(url)
+            .output()
+    })
+    .await
+    .expect("join Node.js harness")
+    .expect("run Node.js harness");
+    server.abort();
+    assert!(
+        output.status.success(),
+        "TypeScript harness failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
 async fn fragment_limits_conflicts_and_timeout_fail_closed() {
     let config = ServerConfig {
         max_fragment_batches: 2,

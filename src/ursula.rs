@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -9,6 +10,7 @@ use crate::frame::ProducerTuple;
 const CONTENT_TYPE: &str = "application/vnd.quorum-loro.delta-frame.v1";
 const HEADER_NEXT_OFFSET: &str = "stream-next-offset";
 const HEADER_UP_TO_DATE: &str = "stream-up-to-date";
+const HEADER_RAFT_LEADER_ID: &str = "x-ursula-raft-leader-id";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppendOutcome {
@@ -62,6 +64,8 @@ pub trait UrsulaStore: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct HttpUrsulaConfig {
     pub base_url: String,
+    pub redirect_base_urls: Vec<String>,
+    pub max_redirects: usize,
     pub bucket: String,
     pub response_timeout: Duration,
     pub read_chunk_bytes: usize,
@@ -75,6 +79,8 @@ impl Default for HttpUrsulaConfig {
     fn default() -> Self {
         Self {
             base_url: "http://127.0.0.1:4437".into(),
+            redirect_base_urls: Vec::new(),
+            max_redirects: 4,
             bucket: "qloro".into(),
             response_timeout: Duration::from_secs(30),
             read_chunk_bytes: 1024 * 1024,
@@ -90,6 +96,8 @@ impl Default for HttpUrsulaConfig {
 pub struct HttpUrsula {
     config: HttpUrsulaConfig,
     client: reqwest::Client,
+    base_url: reqwest::Url,
+    allowed_origins: HashSet<String>,
 }
 
 impl HttpUrsula {
@@ -106,20 +114,44 @@ impl HttpUrsula {
                 message: "Ursula read limits must be non-zero".into(),
             });
         }
+        let base_url = parse_node_base(&config.base_url)?;
+        let mut allowed_origins = HashSet::new();
+        allowed_origins.insert(url_origin(&base_url));
+        for redirect_base_url in &config.redirect_base_urls {
+            allowed_origins.insert(url_origin(&parse_node_base(redirect_base_url)?));
+        }
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| StoreError::Ambiguous(error.to_string()))?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            base_url,
+            allowed_origins,
+        })
     }
 
-    fn stream_url(&self, stream: &str) -> String {
-        format!(
-            "{}/{}/{}",
-            self.config.base_url.trim_end_matches('/'),
-            self.config.bucket,
-            stream
-        )
+    fn bucket_url(&self) -> Result<reqwest::Url, StoreError> {
+        self.object_url(None)
+    }
+
+    fn stream_url(&self, stream: &str) -> Result<reqwest::Url, StoreError> {
+        self.object_url(Some(stream))
+    }
+
+    fn object_url(&self, stream: Option<&str>) -> Result<reqwest::Url, StoreError> {
+        let mut url = self.base_url.clone();
+        let mut segments = url.path_segments_mut().map_err(|_| StoreError::Rejected {
+            kind: RejectionKind::Invalid,
+            message: "Ursula base URL cannot contain path segments".into(),
+        })?;
+        segments.clear().push(&self.config.bucket);
+        if let Some(stream) = stream {
+            segments.push(stream);
+        }
+        drop(segments);
+        Ok(url)
     }
 
     async fn send(
@@ -135,13 +167,17 @@ impl HttpUrsula {
     async fn send_safe<F>(
         &self,
         operation: &str,
+        initial_url: reqwest::Url,
         request: F,
     ) -> Result<reqwest::Response, StoreError>
     where
-        F: Fn() -> reqwest::RequestBuilder,
+        F: Fn(&reqwest::Url) -> reqwest::RequestBuilder,
     {
         for attempt in 0..=self.config.safe_retries {
-            match self.send(request()).await {
+            match self
+                .send_following_redirects(operation, initial_url.clone(), &request)
+                .await
+            {
                 Ok(response)
                     if is_retryable_status(response.status())
                         && attempt < self.config.safe_retries =>
@@ -157,6 +193,93 @@ impl HttpUrsula {
         }
         Err(StoreError::Ambiguous(format!(
             "{operation} exhausted safe retries"
+        )))
+    }
+
+    async fn send_following_redirects<F>(
+        &self,
+        operation: &str,
+        initial_url: reqwest::Url,
+        request: &F,
+    ) -> Result<reqwest::Response, StoreError>
+    where
+        F: Fn(&reqwest::Url) -> reqwest::RequestBuilder,
+    {
+        let expected_path = initial_url.path().to_owned();
+        let expected_query = initial_url.query().map(str::to_owned);
+        let mut current_url = initial_url;
+        let mut visited = HashSet::new();
+        visited.insert(current_url.as_str().to_owned());
+
+        for redirects in 0..=self.config.max_redirects {
+            let response = self.send(request(&current_url)).await?;
+            if response.status() != StatusCode::TEMPORARY_REDIRECT {
+                return Ok(response);
+            }
+            let Some(leader_id) = response.headers().get(HEADER_RAFT_LEADER_ID) else {
+                return Ok(response);
+            };
+            let leader_id = leader_id
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| {
+                    StoreError::Ambiguous(format!(
+                        "{operation} received malformed Ursula leader ID"
+                    ))
+                })?;
+            if redirects >= self.config.max_redirects {
+                return Err(StoreError::Ambiguous(format!(
+                    "{operation} exceeded {} Ursula leader redirects",
+                    self.config.max_redirects
+                )));
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| {
+                    StoreError::Ambiguous(format!(
+                        "{operation} received Ursula leader redirect without valid Location"
+                    ))
+                })?;
+            let target = reqwest::Url::parse(location).map_err(|error| {
+                StoreError::Ambiguous(format!(
+                    "{operation} received malformed Ursula redirect target: {error}"
+                ))
+            })?;
+            if !self.allowed_origins.contains(&url_origin(&target)) {
+                return Err(StoreError::Ambiguous(format!(
+                    "{operation} received Ursula redirect to an unconfigured origin"
+                )));
+            }
+            if target.username() != "" || target.password().is_some() {
+                return Err(StoreError::Ambiguous(format!(
+                    "{operation} received Ursula redirect containing credentials"
+                )));
+            }
+            if target.path() != expected_path || target.query() != expected_query.as_deref() {
+                return Err(StoreError::Ambiguous(format!(
+                    "{operation} received Ursula redirect that changed the request target"
+                )));
+            }
+            if !visited.insert(target.as_str().to_owned()) {
+                return Err(StoreError::Ambiguous(format!(
+                    "{operation} detected an Ursula redirect loop"
+                )));
+            }
+            tracing::info!(
+                operation,
+                leader_id,
+                redirect = redirects + 1,
+                target_origin = %url_origin(&target),
+                "following Ursula leader redirect"
+            );
+            current_url = target;
+        }
+
+        Err(StoreError::Ambiguous(format!(
+            "{operation} exhausted Ursula redirect handling"
         )))
     }
 
@@ -229,11 +352,14 @@ impl HttpUrsula {
         offset: u64,
         max_bytes: usize,
     ) -> Result<(Vec<u8>, u64, bool), StoreError> {
+        let mut url = self.stream_url(stream)?;
+        url.query_pairs_mut()
+            .append_pair("offset", &offset.to_string())
+            .append_pair("max_bytes", &max_bytes.to_string());
         let response = self
-            .send(self.client.get(self.stream_url(stream)).query(&[
-                ("offset", offset.to_string()),
-                ("max_bytes", max_bytes.to_string()),
-            ]))
+            .send_following_redirects("read stream", url, &|target| {
+                self.client.get(target.clone())
+            })
             .await?;
         if response.status() != StatusCode::OK {
             if is_unknown_status(response.status()) {
@@ -269,13 +395,11 @@ impl HttpUrsula {
 #[async_trait]
 impl UrsulaStore for HttpUrsula {
     async fn ensure_stream(&self, stream: &str) -> Result<(), StoreError> {
-        let bucket_url = format!(
-            "{}/{}",
-            self.config.base_url.trim_end_matches('/'),
-            self.config.bucket
-        );
+        let bucket_url = self.bucket_url()?;
         let bucket = self
-            .send_safe("create bucket", || self.client.put(&bucket_url))
+            .send_safe("create bucket", bucket_url, |target| {
+                self.client.put(target.clone())
+            })
             .await?;
         if !bucket.status().is_success() {
             if is_unknown_status(bucket.status()) {
@@ -286,10 +410,11 @@ impl UrsulaStore for HttpUrsula {
             }
             return Err(classify_rejection(bucket.status(), "create bucket"));
         }
+        let stream_url = self.stream_url(stream)?;
         let response = self
-            .send_safe("create stream", || {
+            .send_safe("create stream", stream_url, |target| {
                 self.client
-                    .put(self.stream_url(stream))
+                    .put(target.clone())
                     .header(reqwest::header::CONTENT_TYPE, CONTENT_TYPE)
             })
             .await?;
@@ -369,16 +494,17 @@ impl UrsulaStore for HttpUrsula {
         producer: &ProducerTuple,
         body: &[u8],
     ) -> Result<AppendOutcome, StoreError> {
+        let stream_url = self.stream_url(stream)?;
         let response = self
-            .send(
+            .send_following_redirects("append", stream_url, &|target| {
                 self.client
-                    .post(self.stream_url(stream))
+                    .post(target.clone())
                     .header(reqwest::header::CONTENT_TYPE, CONTENT_TYPE)
                     .header("producer-id", &producer.id)
                     .header("producer-epoch", producer.epoch)
                     .header("producer-seq", producer.sequence)
-                    .body(body.to_vec()),
-            )
+                    .body(body.to_vec())
+            })
             .await?;
         let status = response.status();
         if matches!(status, StatusCode::OK | StatusCode::NO_CONTENT) {
@@ -396,6 +522,31 @@ impl UrsulaStore for HttpUrsula {
             Err(classify_rejection(status, "append"))
         }
     }
+}
+
+fn parse_node_base(value: &str) -> Result<reqwest::Url, StoreError> {
+    let url = reqwest::Url::parse(value).map_err(|error| StoreError::Rejected {
+        kind: RejectionKind::Invalid,
+        message: format!("invalid Ursula node URL: {error}"),
+    })?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || url.username() != ""
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/"
+    {
+        return Err(StoreError::Rejected {
+            kind: RejectionKind::Invalid,
+            message: "Ursula node URL must be an HTTP(S) origin without credentials, path, query, or fragment".into(),
+        });
+    }
+    Ok(url)
+}
+
+fn url_origin(url: &reqwest::Url) -> String {
+    url.origin().ascii_serialization()
 }
 
 fn parse_offset(headers: &reqwest::header::HeaderMap, name: &str) -> Result<u64, StoreError> {
@@ -461,11 +612,98 @@ mod tests {
     use axum::body::Body;
     use axum::body::Bytes;
     use axum::extract::State;
+    use axum::http::HeaderMap;
     use axum::http::HeaderValue;
     use axum::response::Response;
     use axum::routing::any;
 
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct AppendObservation {
+        requests: usize,
+        producer_id: String,
+        producer_epoch: String,
+        producer_sequence: String,
+        content_type: String,
+        body: Vec<u8>,
+    }
+
+    #[derive(Clone)]
+    struct RedirectTarget {
+        location: String,
+        leader_id: &'static str,
+    }
+
+    async fn bind_test_server() -> (tokio::net::TcpListener, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirect test server");
+        let address = listener.local_addr().expect("redirect test address");
+        (listener, format!("http://{address}"))
+    }
+
+    fn spawn_test_server(listener: tokio::net::TcpListener, router: Router) {
+        tokio::spawn(axum::serve(listener, router).into_future());
+    }
+
+    async fn observe_append(
+        State(observation): State<Arc<std::sync::Mutex<AppendObservation>>>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Response {
+        let mut observation = observation.lock().expect("append observation lock");
+        observation.requests += 1;
+        observation.producer_id = test_header(&headers, "producer-id");
+        observation.producer_epoch = test_header(&headers, "producer-epoch");
+        observation.producer_sequence = test_header(&headers, "producer-seq");
+        observation.content_type = test_header(&headers, "content-type");
+        observation.body = body.to_vec();
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(HEADER_NEXT_OFFSET, body.len().to_string())
+            .body(Body::empty())
+            .expect("build append response")
+    }
+
+    async fn redirect(State(target): State<RedirectTarget>) -> Response {
+        Response::builder()
+            .status(StatusCode::TEMPORARY_REDIRECT)
+            .header(reqwest::header::LOCATION, target.location)
+            .header(HEADER_RAFT_LEADER_ID, target.leader_id)
+            .body(Body::empty())
+            .expect("build leader redirect")
+    }
+
+    fn test_header(headers: &HeaderMap, name: &str) -> String {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    fn redirect_store(base_url: String, peers: Vec<String>) -> HttpUrsula {
+        HttpUrsula::new(HttpUrsulaConfig {
+            base_url,
+            redirect_base_urls: peers,
+            bucket: "test".into(),
+            response_timeout: Duration::from_millis(100),
+            safe_retries: 0,
+            retry_base_delay: Duration::ZERO,
+            retry_max_delay: Duration::ZERO,
+            ..HttpUrsulaConfig::default()
+        })
+        .expect("create redirect test client")
+    }
+
+    fn test_producer() -> ProducerTuple {
+        ProducerTuple {
+            id: "producer-a".into(),
+            epoch: 7,
+            sequence: 11,
+        }
+    }
 
     async fn serve(router: Router, configure: impl FnOnce(&mut HttpUrsulaConfig)) -> HttpUrsula {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -609,6 +847,221 @@ mod tests {
                 kind: RejectionKind::RateLimited,
                 ..
             })
+        ));
+    }
+
+    #[tokio::test]
+    async fn append_sent_to_leader_commits_without_redirect() {
+        let (leader_listener, leader_url) = bind_test_server().await;
+        let observation = Arc::new(std::sync::Mutex::new(AppendObservation::default()));
+        spawn_test_server(
+            leader_listener,
+            Router::new()
+                .fallback(any(observe_append))
+                .with_state(observation.clone()),
+        );
+        let store = redirect_store(leader_url, Vec::new());
+
+        assert_eq!(
+            store
+                .append("stream", &test_producer(), b"exact-frame")
+                .await
+                .expect("leader append"),
+            AppendOutcome::Committed { next_offset: 11 }
+        );
+        assert_eq!(observation.lock().expect("observation lock").requests, 1);
+    }
+
+    #[tokio::test]
+    async fn follower_redirect_preserves_exact_append_request() {
+        let (leader_listener, leader_url) = bind_test_server().await;
+        let observation = Arc::new(std::sync::Mutex::new(AppendObservation::default()));
+        spawn_test_server(
+            leader_listener,
+            Router::new()
+                .fallback(any(observe_append))
+                .with_state(observation.clone()),
+        );
+        let (follower_listener, follower_url) = bind_test_server().await;
+        spawn_test_server(
+            follower_listener,
+            Router::new()
+                .fallback(any(redirect))
+                .with_state(RedirectTarget {
+                    location: format!("{leader_url}/test/stream"),
+                    leader_id: "2",
+                }),
+        );
+        let store = redirect_store(follower_url, vec![leader_url]);
+
+        assert_eq!(
+            store
+                .append("stream", &test_producer(), b"exact-frame")
+                .await
+                .expect("redirected append"),
+            AppendOutcome::Committed { next_offset: 11 }
+        );
+        let observation = observation.lock().expect("observation lock");
+        assert_eq!(observation.requests, 1);
+        assert_eq!(observation.producer_id, "producer-a");
+        assert_eq!(observation.producer_epoch, "7");
+        assert_eq!(observation.producer_sequence, "11");
+        assert_eq!(observation.content_type, CONTENT_TYPE);
+        assert_eq!(observation.body, b"exact-frame");
+    }
+
+    #[tokio::test]
+    async fn follows_leader_changes_across_redirect_hops() {
+        let (leader_listener, leader_url) = bind_test_server().await;
+        spawn_test_server(
+            leader_listener,
+            Router::new().fallback(any(|| async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(HEADER_NEXT_OFFSET, "5")
+                    .body(Body::empty())
+                    .expect("final leader response")
+            })),
+        );
+        let (former_leader_listener, former_leader_url) = bind_test_server().await;
+        spawn_test_server(
+            former_leader_listener,
+            Router::new()
+                .fallback(any(redirect))
+                .with_state(RedirectTarget {
+                    location: format!("{leader_url}/test/stream"),
+                    leader_id: "3",
+                }),
+        );
+        let (follower_listener, follower_url) = bind_test_server().await;
+        spawn_test_server(
+            follower_listener,
+            Router::new()
+                .fallback(any(redirect))
+                .with_state(RedirectTarget {
+                    location: format!("{former_leader_url}/test/stream"),
+                    leader_id: "2",
+                }),
+        );
+        let limited = HttpUrsula::new(HttpUrsulaConfig {
+            base_url: follower_url.clone(),
+            redirect_base_urls: vec![former_leader_url.clone(), leader_url.clone()],
+            max_redirects: 1,
+            bucket: "test".into(),
+            safe_retries: 0,
+            ..HttpUrsulaConfig::default()
+        })
+        .expect("create redirect-limited client");
+        assert!(matches!(
+            limited.append("stream", &test_producer(), b"frame").await,
+            Err(StoreError::Ambiguous(message)) if message.contains("exceeded 1")
+        ));
+        let store = redirect_store(
+            follower_url,
+            vec![former_leader_url.clone(), leader_url.clone()],
+        );
+
+        assert_eq!(
+            store
+                .append("stream", &test_producer(), b"frame")
+                .await
+                .expect("append after leader changes"),
+            AppendOutcome::Committed { next_offset: 5 }
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_redirect_loop() {
+        let (first_listener, first_url) = bind_test_server().await;
+        let (second_listener, second_url) = bind_test_server().await;
+        spawn_test_server(
+            first_listener,
+            Router::new()
+                .fallback(any(redirect))
+                .with_state(RedirectTarget {
+                    location: format!("{second_url}/test/stream"),
+                    leader_id: "2",
+                }),
+        );
+        spawn_test_server(
+            second_listener,
+            Router::new()
+                .fallback(any(redirect))
+                .with_state(RedirectTarget {
+                    location: format!("{first_url}/test/stream"),
+                    leader_id: "1",
+                }),
+        );
+        let store = redirect_store(first_url, vec![second_url]);
+
+        assert!(matches!(
+            store.append("stream", &test_producer(), b"frame").await,
+            Err(StoreError::Ambiguous(message)) if message.contains("redirect loop")
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_or_unconfigured_redirect() {
+        let (malformed_listener, malformed_url) = bind_test_server().await;
+        spawn_test_server(
+            malformed_listener,
+            Router::new().fallback(any(|| async {
+                Response::builder()
+                    .status(StatusCode::TEMPORARY_REDIRECT)
+                    .header(HEADER_RAFT_LEADER_ID, "2")
+                    .header(reqwest::header::LOCATION, "/test/stream")
+                    .body(Body::empty())
+                    .expect("malformed redirect response")
+            })),
+        );
+        let store = redirect_store(malformed_url, Vec::new());
+        assert!(matches!(
+            store.append("stream", &test_producer(), b"frame").await,
+            Err(StoreError::Ambiguous(message)) if message.contains("malformed")
+        ));
+
+        let (foreign_listener, foreign_url) = bind_test_server().await;
+        spawn_test_server(
+            foreign_listener,
+            Router::new()
+                .fallback(any(redirect))
+                .with_state(RedirectTarget {
+                    location: "http://127.0.0.1:9/test/stream".into(),
+                    leader_id: "9",
+                }),
+        );
+        let store = redirect_store(foreign_url, Vec::new());
+        assert!(matches!(
+            store.append("stream", &test_producer(), b"frame").await,
+            Err(StoreError::Ambiguous(message)) if message.contains("unconfigured origin")
+        ));
+    }
+
+    #[tokio::test]
+    async fn unavailable_redirect_target_is_ambiguous() {
+        let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve unavailable redirect target");
+        let unavailable_url = format!(
+            "http://{}",
+            unavailable.local_addr().expect("unavailable address")
+        );
+        drop(unavailable);
+        let (follower_listener, follower_url) = bind_test_server().await;
+        spawn_test_server(
+            follower_listener,
+            Router::new()
+                .fallback(any(redirect))
+                .with_state(RedirectTarget {
+                    location: format!("{unavailable_url}/test/stream"),
+                    leader_id: "2",
+                }),
+        );
+        let store = redirect_store(follower_url, vec![unavailable_url]);
+
+        assert!(matches!(
+            store.append("stream", &test_producer(), b"frame").await,
+            Err(StoreError::Ambiguous(message)) if message.contains("error sending request")
         ));
     }
 }

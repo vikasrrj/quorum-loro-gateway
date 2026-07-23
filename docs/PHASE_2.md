@@ -63,6 +63,27 @@ the method, exact append bytes and producer tuple, enforce an allowlist and hop
 bound, reject loops/malformed targets, and never treat a redirect as commit
 proof.
 
+The implemented transport accepts only `307`, requires a numeric
+`x-ursula-raft-leader-id`, requires an absolute `Location` whose origin appears
+in the configured node list, and requires every hop to preserve the initial
+path and query. It detects repeated target URLs and enforces
+`--ursula-max-redirects`. Redirect failures and unreachable targets are
+ambiguous outcomes, never commit proof. Append replay rebuilds every request
+from the retained frame bytes and producer tuple; no redirect changes
+`Producer-Seq`.
+
+Run the gateway against any cluster node while allowlisting all possible
+redirect targets:
+
+```bash
+cargo run -- \
+  --ursula-url http://127.0.0.1:18102 \
+  --ursula-peer-url http://127.0.0.1:18101 \
+  --ursula-peer-url http://127.0.0.1:18102 \
+  --ursula-peer-url http://127.0.0.1:18103 \
+  --ursula-max-redirects 4
+```
+
 ## Experiment Results
 
 Quorum durability, leader-failure, minority/quorum-loss, producer-state, and

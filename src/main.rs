@@ -20,6 +20,10 @@ struct Args {
     listen: SocketAddr,
     #[arg(long, default_value = "http://127.0.0.1:4437")]
     ursula_url: String,
+    #[arg(long = "ursula-peer-url")]
+    ursula_peer_urls: Vec<String>,
+    #[arg(long, default_value_t = 4)]
+    ursula_max_redirects: usize,
     #[arg(long, default_value = "qloro")]
     ursula_bucket: String,
     #[arg(long, default_value_t = 30)]
@@ -71,6 +75,8 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("update limit does not fit u64"))?;
     let store = Arc::new(HttpUrsula::new(HttpUrsulaConfig {
         base_url: args.ursula_url,
+        redirect_base_urls: args.ursula_peer_urls,
+        max_redirects: args.ursula_max_redirects,
         bucket: args.ursula_bucket,
         response_timeout: Duration::from_secs(args.ursula_timeout_seconds),
         read_chunk_bytes: args.ursula_read_chunk_bytes,

@@ -295,13 +295,16 @@ async fn joined_room(
     let (tx, mut rx) = mpsc::unbounded_channel();
     room.join(connection_id, Vec::new(), tx.clone()).await;
     let message = recv_protocol(&mut rx).await;
-    assert!(matches!(
-        message,
-        ProtocolMessage::JoinResponseOk {
-            permission: Permission::Write,
-            ..
-        }
-    ));
+    assert!(
+        matches!(
+            &message,
+            ProtocolMessage::JoinResponseOk {
+                permission: Permission::Write,
+                ..
+            }
+        ),
+        "join failed: {message:?}"
+    );
     (room, tx, rx)
 }
 

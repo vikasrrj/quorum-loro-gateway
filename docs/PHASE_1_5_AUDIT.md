@@ -185,3 +185,28 @@ detached room actor can continue running.
 Phase 1.5 does not implement manifests, checkpoints, generation rotation,
 retention, DELETE, multi-gateway coordination, authorization, or Ursula source
 changes.
+
+## Phase 1.5 Resolution
+
+The selected fixes were implemented in focused milestones after this baseline
+audit:
+
+- Durable frame and history limits are enforced before attacker-controlled
+  allocation, and recovery errors carry stream offsets.
+- `Ack(Ok)` requires a typed committed or fully verified duplicate proof.
+- HTTP reads enforce exact offset/body progress, bounded timed bodies, bounded
+  total replay, redirect rejection, and safe-operation retries with jitter.
+- A structural precheck protects the pinned official decoder from hostile
+  update counts before invoking it.
+- Fragment batches, counts, aggregate reservation, conflicts, timeout, leave,
+  and disconnect cleanup are bounded; oversized live fan-out is fragmented.
+- Room lifecycle is explicit and visible at `/debug/rooms`; ambiguous joins and
+  writes fail closed and controlled reconciliation reloads Ursula.
+- Full snapshots are empty-room initialization only; shallow and replacement
+  snapshots are rejected before storage.
+- The feature-gated child-process crash test now proves the post-commit/pre-ACK
+  boundary and Ursula-only restart recovery.
+- The pinned official TypeScript packages now pass bidirectional convergence
+  through the gateway.
+
+The non-production limitations and later-phase deferrals above remain in force.

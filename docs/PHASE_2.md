@@ -110,5 +110,54 @@ This proves survival of one voter failure for an acknowledged update in the
 tested three-voter, disk-WAL topology. It does not claim recovery from two or
 three lost replicas.
 
-Leader-failure, quorum-loss, producer-state, and full-replay results remain
-pending and will be recorded only after their scripts and raw results run.
+### Leader failure
+
+All leader-failure tests use actual Ursula and gateway processes:
+
+- **Before the append reached the leader:** the stream leader was SIGKILLed
+  immediately before submission. The observed result was `Ack(Unknown)`. The
+  room entered `append_ambiguous`, and the next update returned `RateLimited`;
+  no later `Producer-Seq` reached Ursula.
+- **After replication, before the gateway received the HTTP response:** a
+  test-only reverse proxy forwarded the append and waited for Ursula `200`,
+  then held that response while the leader was SIGKILLed. It returned `503` to
+  the gateway. The exact tuple/body retry reached the new leader, Ursula
+  returned `204`, the gateway verified the exact stored frame range, and only
+  then returned `Ack(Ok)`. The durable stream contained exactly one frame.
+- **After the client received `Ack(Ok)`:** the current stream leader was
+  SIGKILLed. A fresh gateway started against a survivor after re-election and
+  reconstructed the acknowledged update.
+
+Run the three scenarios serially because they use fixed isolated ports:
+
+```bash
+cargo test --test phase2_cluster leader_failure \
+  -- --ignored --nocapture --test-threads=1
+```
+
+### Minority and quorum loss
+
+After voter 3 was SIGKILLed, voters 1 and 2 elected leaders for all four groups,
+and a subsequent update received `Ack(Ok)`. After voter 1 was also SIGKILLed:
+
+- the next append returned `Ack(Unknown)`, never `Ack(Ok)`;
+- the following update returned `RateLimited`, proving the sequence remained
+  blocked behind the unresolved append;
+- the sole surviving follower returned `200` for a finite read containing 518
+  committed bytes in this test;
+- that read omitted a true `stream-up-to-date` claim.
+
+Run the experiment with:
+
+```bash
+cargo test --test phase2_cluster \
+  one_voter_allows_writes_but_quorum_loss_never_acks \
+  -- --ignored --nocapture
+```
+
+Ordinary finite reads can therefore remain available from a minority, but they
+must be treated as potentially stale. Writes cannot commit without two voters.
+No total-cluster-loss recovery claim is made.
+
+Producer-state and full-replay measurements remain pending and will be recorded
+only after their scripts and raw results run.

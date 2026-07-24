@@ -670,6 +670,80 @@ async fn restart_replays_without_local_durable_state() {
     doc.import_batch(&updates).expect("import replay");
     assert_eq!(doc.get_text("text").to_string(), "durable");
 }
+#[tokio::test]
+async fn pending_update_survives_restart_and_applies_after_dependency() {
+    let source = LoroDoc::new();
+    source.set_peer_id(77).expect("set source peer");
+
+    let before_first = source.oplog_vv();
+
+    source
+        .get_text("text")
+        .insert(0, "one")
+        .expect("insert first update");
+    source.commit();
+
+    let after_first = source.oplog_vv();
+
+    let first_update = source
+        .export(ExportMode::updates(&before_first))
+        .expect("export first update");
+
+    source
+        .get_text("text")
+        .insert(3, "-two")
+        .expect("insert second update");
+    source.commit();
+
+    let second_update = source
+        .export(ExportMode::updates(&after_first))
+        .expect("export second update");
+
+    let store = MemoryStore::new();
+
+    // Store the second update first, while its dependency is missing.
+    let first = manager(store.clone(), 21);
+    let (room, tx, mut rx) = joined_room(&first, "pending-restart", 1).await;
+
+    room.update(1, BatchId([21; 8]), vec![second_update], tx)
+        .await;
+
+    assert_eq!(recv_ack(&mut rx).await, UpdateStatusCode::Ok);
+
+    drop(room);
+    drop(first);
+
+    // Restart and then provide the missing dependency.
+    let restarted = manager(store, 22);
+    let (room, tx, mut rx) = joined_room(&restarted, "pending-restart", 2).await;
+
+    room.update(2, BatchId([22; 8]), vec![first_update], tx)
+        .await;
+
+    assert_eq!(recv_ack(&mut rx).await, UpdateStatusCode::Ok);
+
+    // A fresh join should now receive a document containing both updates.
+    let (_room, _tx, mut final_rx) = joined_room(&restarted, "pending-restart", 3).await;
+
+    let updates = doc_updates(recv_protocol(&mut final_rx).await)
+        .expect("expected resolved document backfill");
+
+    let final_doc = LoroDoc::new();
+    let status = final_doc
+        .import_batch(&updates)
+        .expect("import resolved backfill");
+
+    assert!(
+        status.pending.is_none(),
+        "resolved document backfill should not remain pending"
+    );
+
+    assert_eq!(
+        final_doc.get_text("text").to_string(),
+        "one-two",
+        "pending update was not preserved across gateway restart"
+    );
+}
 
 #[tokio::test]
 async fn crash_after_commit_before_ack_recovers_from_ursula() {

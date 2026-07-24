@@ -1,110 +1,142 @@
 # Quorum Loro Gateway
 
-A self-hosted Loro sync server backed by Ursula durable streams.
+A self-hosted Loro synchronization server backed by Ursula’s quorum-replicated durable streams.
 
-The gateway accepts Loro updates over WebSocket, stores the exact update bytes in Ursula, and returns `Ack(Ok)` only after the write is durably committed or a previous duplicate commit is verified.
+The gateway stores the exact Loro update bytes in Ursula and returns `Ack(Ok)` only after the update is durably committed or an earlier duplicate commit is verified byte-for-byte.
 
-This is currently a hardened prototype.
+> **Current version: v0.1 prototype**
 
 ## How it works
 
 ```text
 Loro client
-    ↓ WebSocket
+    │ WebSocket
+    ▼
 Quorum Loro Gateway
-    ↓ durable append
-Ursula quorum-backed stream
-    ↓ commit confirmed
+    │ Durable append
+    ▼
+Ursula quorum
+    │ Commit confirmed
+    ▼
 Ack(Ok)
+```
 
-Loro handles CRDT merging and offline edits.
+Loro handles CRDT merging and offline edits. Ursula handles durable ordering, replication, and replay. The gateway connects them and decides when an update is safe to acknowledge.
 
-Ursula handles durable ordering, replication, and replay.
+## Available in v0.1
 
-The gateway connects them and controls when an update is acknowledged.
+- Loro Synchronization Protocol v1 over WebSocket
+- `%LOR` rooms
+- Rust and TypeScript client interoperability
+- Normal and fragmented Loro updates
+- Exact Loro byte storage without decode-and-reencode changes
+- Durable `Ack(Ok)` after commit
+- Producer retries and byte-verified duplicate handling
+- Recovery after gateway restart
+- Recovery when a commit succeeds but the ACK is lost
+- Complete room reconstruction from Ursula
+- Corrupt and malformed history detection
+- Ursula leader redirect handling
+- Health and room-debug endpoints
+- Tested three-voter Ursula quorum
+- Tested voter failure, leader failure, gateway crash, and quorum loss
 
-Current version
+The gateway does not require its own local durable database. After restarting, it rebuilds room state directly from Ursula.
 
-The current version supports:
+## Durability guarantee
 
-Loro Synchronization Protocol v1
-%LOR rooms
-official Rust and TypeScript clients
-normal and fragmented Loro updates
-exact update-byte storage
-durable Ack(Ok)
-producer retry and duplicate verification
-gateway crash recovery
-complete room reconstruction from Ursula
-corruption and malformed-frame detection
-Ursula leader redirects
-tested three-voter quorum behavior
-one-voter and leader failure testing
-health and room debug endpoints
+`Ack(Ok)` means one of the following is true:
 
-The gateway does not need its own local durable database. It rebuilds room state from Ursula after restarting.
+1. Ursula confirmed that the exact update frame was committed.
+2. Ursula recognized a retry, and the gateway read the committed frame back and verified it byte-for-byte.
 
-Durability guarantee
+Timeouts, transport failures, invalid responses, uncertain writes, and failed duplicate verification never return `Ack(Ok)`.
 
-Ack(Ok) means the exact update frame was committed to Ursula, or an already committed retry was read back and verified byte-for-byte.
+When the result of a write cannot be safely determined, the room stops accepting joins and updates until the write is resolved.
 
-Timeouts, transport failures, malformed responses, failed duplicate verification, and uncertain writes never return Ack(Ok).
+## Storage and recovery
 
-When the gateway cannot determine whether a write committed, the room fails closed until the write is safely resolved.
+Each room currently uses one permanent append-only Ursula stream.
 
-Current storage model
+```text
+Room stream
+├── update 1
+├── update 2
+├── update 3
+└── ...
+```
 
-Each room currently uses one append-only Ursula stream.
+Every append is stored in a versioned `QLGD` frame containing the producer identity, sequence, batch ID, exact Loro blobs, SHA-256 digest, and CRC32 checksum.
 
-On startup, the gateway replays the full stream to rebuild the Loro document.
+During recovery, every frame is replayed and verified in order. Invalid, incomplete, or corrupted frames are rejected rather than skipped.
 
-Measured replay results:
+## Replay performance
 
-Updates	History size	p95 activation
-10,000	1.94 MiB	237 ms
-50,000	9.78 MiB	912 ms
-100,000	19.61 MiB	1.90 s
-250,000	49.08 MiB	4.82 s
+Room activation currently requires replaying the full stream.
 
-These results suggest checkpointing becomes useful as room history grows.
+| Updates | Encoded history | p95 activation |
+|--------:|----------------:|---------------:|
+| 10,000 | 1.94 MiB | 237 ms |
+| 25,000 | 4.87 MiB | 533 ms |
+| 50,000 | 9.78 MiB | 912 ms |
+| 100,000 | 19.61 MiB | 1.90 s |
+| 250,000 | 49.08 MiB | 4.82 s |
 
-Run
+These measurements used a release-mode gateway and a real three-voter Ursula cluster. Replay remained approximately linear through 250,000 updates.
 
-Start Ursula locally, then run:
+## Run locally
 
+Start Ursula on `127.0.0.1:4437`, then run:
+
+```bash
 cargo run -- \
   --listen 127.0.0.1:8080 \
   --ursula-url http://127.0.0.1:4437
+```
 
-Connect a Loro client to:
+Connect a Loro protocol client to:
 
+```text
 ws://127.0.0.1:8080/ws
+```
 
-Run the standard checks:
+Operational endpoints:
 
+```text
+GET /healthz
+GET /debug/rooms
+```
+
+The debug endpoint reports room lifecycle and recovery metrics without returning document contents or update bytes.
+
+## Verification
+
+```bash
 cargo fmt --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
-Main limitations
-full room history is replayed after restart
-no checkpoints or stream rotation yet
-one permanent stream per room
-no authentication or authorization
-no safe multi-gateway writing
-no retention or cleanup system
-no complete-cluster disaster recovery guarantee
-not production-ready
-Remaining work
+```
 
-The next major step is bounded recovery using checkpoints and stream generations.
+Some real-cluster, crash-injection, interoperability, and benchmark tests are ignored by default because they require Ursula, Node.js, or separate child processes.
 
-Later work includes authentication, retention, multi-gateway coordination, actor cleanup, slow-client limits, and larger production-style testing.
+## Main limitations
 
-Detailed documentation
+- Full room history is replayed after every activation
+- One permanent stream is used per room
+- No checkpoints or stream rotation
+- No retention or old-history cleanup
+- No authentication or authorization
+- No safe multi-gateway writing
+- Fan-out exists only inside one gateway process
+- No complete Ursula cluster-loss guarantee
+- Not production-ready
 
-More detailed design notes, failure tests, and benchmark results are available in the docs directory.
+## Remaining work
 
+The next version will focus on bounded recovery using immutable Loro checkpoints and sealed stream generations.
 
-Then commit it manually:
+Later work includes retention, authentication, actor cleanup, slow-client limits, multi-gateway coordination, and broader production-style failure testing.
 
-```bash
+## Documentation
+
+Detailed design notes, audits, failure experiments, and benchmark results are available in the [`docs`](docs/) directory.

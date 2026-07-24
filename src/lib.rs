@@ -6,6 +6,7 @@
 pub mod actor;
 pub mod checkpoint;
 pub mod frame;
+pub mod manifest;
 pub mod names;
 pub mod protocol;
 pub mod server;

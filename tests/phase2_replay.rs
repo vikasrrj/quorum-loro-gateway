@@ -376,7 +376,7 @@ async fn full_replay_worker() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "release-mode benchmark requiring isolated real Phase 2 Ursula clusters"]
+#[ignore = "release-mode benchmark requiring isolated real Ursula clusters"]
 async fn full_replay_benchmark() -> anyhow::Result<()> {
     anyhow::ensure!(
         !cfg!(debug_assertions),

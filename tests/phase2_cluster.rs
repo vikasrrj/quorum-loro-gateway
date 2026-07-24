@@ -291,13 +291,13 @@ fn update_blob() -> Vec<u8> {
 
 fn update_blob_with(text: &str, peer_id: u64) -> Vec<u8> {
     let doc = LoroDoc::new();
-    doc.set_peer_id(peer_id).expect("set Phase 2 peer ID");
+    doc.set_peer_id(peer_id).expect("set cluster-test peer ID");
     doc.get_text("text")
         .insert(0, text)
-        .expect("insert Phase 2 text");
+        .expect("insert cluster-test text");
     doc.commit();
     doc.export(ExportMode::all_updates())
-        .expect("export Phase 2 update")
+        .expect("export cluster-test update")
 }
 
 async fn submit_update(
@@ -398,7 +398,7 @@ async fn leader_for_stream(stream: &str) -> anyhow::Result<u8> {
 }
 
 #[tokio::test]
-#[ignore = "requires /home/vik/ursula/target/release/ursula and free Phase 2 ports"]
+#[ignore = "requires /home/vik/ursula/target/release/ursula and free cluster-test ports"]
 async fn acknowledged_update_survives_one_voter_and_gateway_crash() -> anyhow::Result<()> {
     let _cluster = ClusterGuard::start()?;
     let listen = reserve_address()?;
@@ -452,7 +452,7 @@ async fn acknowledged_update_survives_one_voter_and_gateway_crash() -> anyhow::R
 }
 
 #[tokio::test]
-#[ignore = "requires /home/vik/ursula/target/release/ursula and free Phase 2 ports"]
+#[ignore = "requires /home/vik/ursula/target/release/ursula and free cluster-test ports"]
 async fn one_voter_allows_writes_but_quorum_loss_never_acks() -> anyhow::Result<()> {
     let cluster = ClusterGuard::start()?;
     let listen = reserve_address()?;
@@ -551,7 +551,7 @@ async fn one_voter_allows_writes_but_quorum_loss_never_acks() -> anyhow::Result<
 }
 
 #[tokio::test]
-#[ignore = "requires /home/vik/ursula/target/release/ursula and free Phase 2 ports"]
+#[ignore = "requires /home/vik/ursula/target/release/ursula and free cluster-test ports"]
 async fn leader_failure_before_append_never_advances_unresolved_sequence() -> anyhow::Result<()> {
     let cluster = ClusterGuard::start()?;
     let listen = reserve_address()?;
@@ -595,7 +595,7 @@ async fn leader_failure_before_append_never_advances_unresolved_sequence() -> an
 }
 
 #[tokio::test]
-#[ignore = "requires /home/vik/ursula/target/release/ursula and free Phase 2 ports"]
+#[ignore = "requires /home/vik/ursula/target/release/ursula and free cluster-test ports"]
 async fn acknowledged_update_survives_current_leader_failure() -> anyhow::Result<()> {
     let cluster = ClusterGuard::start()?;
     let listen = reserve_address()?;
@@ -647,7 +647,7 @@ async fn acknowledged_update_survives_current_leader_failure() -> anyhow::Result
 }
 
 #[tokio::test]
-#[ignore = "requires /home/vik/ursula/target/release/ursula and free Phase 2 ports"]
+#[ignore = "requires /home/vik/ursula/target/release/ursula and free cluster-test ports"]
 async fn leader_failure_after_commit_before_response_requires_verified_duplicate()
 -> anyhow::Result<()> {
     let cluster = ClusterGuard::start()?;

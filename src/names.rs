@@ -15,7 +15,7 @@ pub fn delta_stream(room_id: &str) -> StreamName {
     let hash = document_hash(room_id);
     StreamName {
         logical: format!("room/{hash}/delta/0"),
-        // Ursula stream IDs reject slashes, so Phase 1 uses a deterministic
+        // Ursula stream IDs reject slashes, so the gateway uses a deterministic
         // physical encoding while preserving the approved logical name.
         physical: format!("r-{hash}-d0"),
     }

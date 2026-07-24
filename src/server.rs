@@ -191,7 +191,7 @@ async fn handle_message(
                         crdt,
                         room_id,
                         code: JoinErrorCode::AppError,
-                        message: "Phase 1 supports only %LOR rooms".into(),
+                        message: "only %LOR rooms are supported".into(),
                         receiver_version: None,
                         app_code: Some("unsupported_crdt".into()),
                     },

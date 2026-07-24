@@ -1,4 +1,4 @@
-//! Phase 1 Quorum Loro Gateway.
+//! Quorum Loro Gateway.
 //!
 //! The crate exposes the official Loro Synchronization Protocol v1 over
 //! WebSocket and stores versioned update frames in one Ursula stream per room.

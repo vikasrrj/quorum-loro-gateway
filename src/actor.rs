@@ -941,10 +941,10 @@ fn validate_update_blobs(updates: &[Vec<u8>], allow_snapshot: bool) -> Result<()
             }
             EncodedBlobMode::Updates => {}
             EncodedBlobMode::ShallowSnapshot => {
-                return Err("shallow snapshots are not supported in Phase 1".into());
+                return Err("shallow snapshots are not supported".into());
             }
             EncodedBlobMode::OutdatedSnapshot | EncodedBlobMode::OutdatedRle => {
-                return Err("outdated Loro encodings are not supported in Phase 1".into());
+                return Err("outdated Loro encodings are not supported".into());
             }
         }
     }

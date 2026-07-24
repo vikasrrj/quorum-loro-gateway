@@ -16,10 +16,10 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 NODE_URLS = [f"http://127.0.0.1:{port}" for port in (18101, 18102, 18103)]
 ADMIN_URLS = [f"http://127.0.0.1:{port}" for port in (18201, 18202, 18203)]
 ALLOWED_ORIGINS = {urllib.parse.urlsplit(url).netloc for url in NODE_URLS}
-ROOM_ID = "phase2-5-restart-room"
+ROOM_ID = "restart-producer-benchmark"
 STREAM = f"r-{hashlib.sha256(ROOM_ID.encode()).hexdigest()}-d0"
 STAGES = (0, 100, 1000, 5000)
-PAYLOAD = b"phase2-restart-state-payload-32"
+PAYLOAD = b"qlg-restart-producer-payload-v1"
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -139,7 +139,7 @@ def trigger_snapshots():
 
 def boot_id(index):
     hasher = hashlib.sha256()
-    hasher.update(b"qlg-phase2-5-boot-v1\0")
+    hasher.update(b"qlg-restart-producer-boot-v1\0")
     hasher.update(index.to_bytes(8, "big"))
     return hasher.digest()[:16]
 
@@ -190,7 +190,7 @@ def append(index, restart_mode):
 
 def run_command(name, root):
     environment = os.environ.copy()
-    environment["PHASE2_CLUSTER_ROOT"] = str(root)
+    environment["QLG_CLUSTER_ROOT"] = str(root)
     return subprocess.run(
         [str(REPO / "scripts" / name)],
         env=environment,
@@ -207,7 +207,7 @@ def force_clean(root):
             os.kill(int(pid_file.read_text().strip()), 9)
         except (FileNotFoundError, ProcessLookupError, ValueError):
             pass
-    result = run_command("phase2-cluster-clean.sh", root)
+    result = run_command("ursula-cluster-clean.sh", root)
     if result.returncode != 0:
         raise RuntimeError(f"cluster cleanup failed: {result.stderr}")
     shutil.rmtree(root.parent, ignore_errors=True)
@@ -215,8 +215,8 @@ def force_clean(root):
 
 def run_workload(restart_mode):
     mode = "restart" if restart_mode else "stable"
-    root = pathlib.Path(tempfile.mkdtemp(prefix=f"qlg-phase2-5-{mode}-")) / "phase2-cluster"
-    start = run_command("phase2-cluster-start.sh", root)
+    root = pathlib.Path(tempfile.mkdtemp(prefix=f"qlg-restart-producer-{mode}-")) / "ursula-cluster"
+    start = run_command("ursula-cluster-start.sh", root)
     if start.returncode != 0:
         raise RuntimeError(
             f"cluster start failed for {mode}:\n{start.stdout}\n{start.stderr}"
@@ -318,7 +318,7 @@ def git_revision():
 
 
 def main():
-    output = REPO / "results" / "phase2_5" / "restart-producers.json"
+    output = REPO / "results" / "producer-state" / "restarts.json"
     output.parent.mkdir(parents=True, exist_ok=True)
     stable = run_workload(False)
     restart = run_workload(True)

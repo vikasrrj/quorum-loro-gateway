@@ -36,7 +36,7 @@ const DEFAULT_COUNTS: [usize; 4] = [25_000, 50_000, 100_000, 250_000];
 const DEFAULT_REPETITIONS: usize = 3;
 const LOAD_CHUNK_BYTES: usize = 1024 * 1024;
 const READ_WINDOW_BYTES: usize = 64 * 1024;
-const RESULT_MARKER: &str = "PHASE2_REPLAY_RESULT=";
+const RESULT_MARKER: &str = "QLG_REPLAY_RESULT=";
 const NODE_URLS: [&str; 3] = [
     "http://127.0.0.1:18101",
     "http://127.0.0.1:18102",
@@ -51,9 +51,9 @@ impl ClusterGuard {
     fn start() -> anyhow::Result<Self> {
         let root = env::temp_dir()
             .join(format!("qlg-replay-{}", uuid::Uuid::new_v4()))
-            .join("phase2-cluster");
-        let output = Command::new(script("phase2-cluster-start.sh"))
-            .env("PHASE2_CLUSTER_ROOT", &root)
+            .join("ursula-cluster");
+        let output = Command::new(script("ursula-cluster-start.sh"))
+            .env("QLG_CLUSTER_ROOT", &root)
             .output()?;
         if !output.status.success() {
             anyhow::bail!(
@@ -79,8 +79,8 @@ impl Drop for ClusterGuard {
                     .status();
             }
         }
-        let _ = Command::new(script("phase2-cluster-clean.sh"))
-            .env("PHASE2_CLUSTER_ROOT", &self.root)
+        let _ = Command::new(script("ursula-cluster-clean.sh"))
+            .env("QLG_CLUSTER_ROOT", &self.root)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -128,7 +128,7 @@ fn build_history(count: usize) -> anyhow::Result<History> {
         max_loro_blob_bytes = max_loro_blob_bytes.max(update.len());
         let frame = DeltaFrame::new(
             ProducerTuple {
-                id: "phase2-5-replay-frame".into(),
+                id: "replay-benchmark-frame".into(),
                 epoch: 0,
                 sequence: u64::try_from(index)?,
             },
@@ -160,7 +160,7 @@ fn build_history(count: usize) -> anyhow::Result<History> {
 
 fn benchmark_state_hash(text: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"qlg-phase2-5-state-v1\0");
+    hasher.update(b"qlg-replay-state-v1\0");
     hasher.update(u64::try_from(text.len()).unwrap_or(u64::MAX).to_be_bytes());
     hasher.update(text.as_bytes());
     format!("{:x}", hasher.finalize())
@@ -356,12 +356,12 @@ async fn leader_url(stream: &str) -> anyhow::Result<String> {
 #[tokio::test]
 #[ignore = "invoked as an isolated worker by full_replay_benchmark"]
 async fn full_replay_worker() -> anyhow::Result<()> {
-    let Ok(room_id) = env::var("PHASE2_REPLAY_WORKER_ROOM") else {
+    let Ok(room_id) = env::var("QLG_REPLAY_WORKER_ROOM") else {
         return Ok(());
     };
-    let leader = env::var("PHASE2_REPLAY_WORKER_LEADER")?;
-    let count = env::var("PHASE2_REPLAY_WORKER_COUNT")?.parse::<usize>()?;
-    let expected_hash = env::var("PHASE2_REPLAY_WORKER_HASH")?;
+    let leader = env::var("QLG_REPLAY_WORKER_LEADER")?;
+    let count = env::var("QLG_REPLAY_WORKER_COUNT")?.parse::<usize>()?;
+    let expected_hash = env::var("QLG_REPLAY_WORKER_HASH")?;
     let store = Arc::new(HttpUrsula::new(HttpUrsulaConfig {
         base_url: leader,
         redirect_base_urls: NODE_URLS.iter().map(ToString::to_string).collect(),
@@ -383,7 +383,7 @@ async fn full_replay_benchmark() -> anyhow::Result<()> {
         "scale benchmark must use --release"
     );
     let counts = benchmark_counts()?;
-    let repetitions = env::var("PHASE2_REPLAY_REPETITIONS")
+    let repetitions = env::var("QLG_REPLAY_REPETITIONS")
         .ok()
         .map(|value| value.parse::<usize>())
         .transpose()?
@@ -395,7 +395,7 @@ async fn full_replay_benchmark() -> anyhow::Result<()> {
         for order_index in 0..counts.len() {
             let count = counts[(order_index + repetition - 1) % counts.len()];
             let _cluster = ClusterGuard::start()?;
-            let room_id = format!("phase2-5-replay-{count}");
+            let room_id = format!("replay-benchmark-{count}");
             let stream_name = delta_stream(&room_id).physical;
             let generation_started = Instant::now();
             let history = build_history(count)?;
@@ -412,7 +412,7 @@ async fn full_replay_benchmark() -> anyhow::Result<()> {
             let load_started = Instant::now();
             for (sequence, chunk) in history.chunks.iter().enumerate() {
                 let loader = ProducerTuple {
-                    id: format!("phase2-5-loader-{count}-{repetition}"),
+                    id: format!("replay-loader-{count}-{repetition}"),
                     epoch: 0,
                     sequence: u64::try_from(sequence)?,
                 };
@@ -491,8 +491,8 @@ async fn full_replay_benchmark() -> anyhow::Result<()> {
     });
     let output_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("results")
-        .join("phase2_5")
-        .join("scale-replay.json");
+        .join("replay")
+        .join("scale.json");
     std::fs::create_dir_all(output_path.parent().context("result parent")?)?;
     std::fs::write(&output_path, serde_json::to_vec_pretty(&output)?)?;
     println!("raw results: {}", output_path.display());
@@ -534,10 +534,10 @@ fn run_worker(
         .arg("--ignored")
         .arg("--nocapture")
         .arg("--test-threads=1")
-        .env("PHASE2_REPLAY_WORKER_ROOM", room_id)
-        .env("PHASE2_REPLAY_WORKER_LEADER", leader)
-        .env("PHASE2_REPLAY_WORKER_COUNT", count.to_string())
-        .env("PHASE2_REPLAY_WORKER_HASH", expected_hash)
+        .env("QLG_REPLAY_WORKER_ROOM", room_id)
+        .env("QLG_REPLAY_WORKER_LEADER", leader)
+        .env("QLG_REPLAY_WORKER_COUNT", count.to_string())
+        .env("QLG_REPLAY_WORKER_HASH", expected_hash)
         .output()?;
     anyhow::ensure!(
         output.status.success(),
@@ -562,7 +562,7 @@ fn run_worker(
 }
 
 fn benchmark_counts() -> anyhow::Result<Vec<usize>> {
-    let Some(value) = env::var_os("PHASE2_REPLAY_COUNTS") else {
+    let Some(value) = env::var_os("QLG_REPLAY_COUNTS") else {
         return Ok(DEFAULT_COUNTS.to_vec());
     };
     let value = value.to_string_lossy();

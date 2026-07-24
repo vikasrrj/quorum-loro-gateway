@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cluster_root="${PHASE2_CLUSTER_ROOT:-${repo_root}/target/phase2-cluster}"
+cluster_root="${QLG_CLUSTER_ROOT:-${repo_root}/target/ursula-cluster}"
 
 is_running() {
   local pid="$1"

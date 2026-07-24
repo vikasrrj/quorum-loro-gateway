@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cluster_root="${PHASE2_CLUSTER_ROOT:-${repo_root}/target/phase2-cluster}"
+cluster_root="${QLG_CLUSTER_ROOT:-${repo_root}/target/ursula-cluster}"
 ursula_bin="${URSULA_BIN:-/home/vik/ursula/target/release/ursula}"
 
 if [[ ! -x "${ursula_bin}" ]]; then
@@ -107,7 +107,7 @@ start_node 3
 start_node 1
 
 cleanup_failed_start() {
-  "${repo_root}/scripts/phase2-cluster-stop.sh" >/dev/null 2>&1 || true
+  "${repo_root}/scripts/ursula-cluster-stop.sh" >/dev/null 2>&1 || true
 }
 trap cleanup_failed_start ERR
 

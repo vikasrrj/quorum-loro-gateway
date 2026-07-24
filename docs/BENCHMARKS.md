@@ -14,7 +14,7 @@ The current gateway rebuilds a room by reading and importing its full Ursula str
 
 Every run reconstructed the expected document and matched the expected state hash.
 
-The useful takeaway is that full replay remained close to linear for this workload. It was still below one second at 50,000 updates, but reached about 1.9 seconds at 100,000 and 4.8 seconds at 250,000.
+Full replay stayed close to linear for this workload. It was still below one second at 50,000 updates, but reached about 1.9 seconds at 100,000 and 4.8 seconds at 250,000.
 
 That makes checkpoints useful for larger rooms, but it does not mean every deployment needs the same cutoff.
 
@@ -36,8 +36,8 @@ The Linux page cache was not dropped, so these are normal warm-host results, not
 
 Raw observations are committed in:
 
-- [`results/phase2_5/scale-replay.json`](../results/phase2_5/scale-replay.json)
-- [`results/phase2/full-replay.json`](../results/phase2/full-replay.json)
+- [`results/replay/scale.json`](../results/replay/scale.json)
+- [`results/replay/initial.json`](../results/replay/initial.json)
 
 ## Recovery breakdown
 
@@ -73,22 +73,22 @@ Producer metadata is much smaller than document replay state here, but it is a s
 
 Raw producer measurements are in:
 
-- [`results/phase2/producer-state.json`](../results/phase2/producer-state.json)
-- [`results/phase2_5/restart-producers.json`](../results/phase2_5/restart-producers.json)
+- [`results/producer-state/direct.json`](../results/producer-state/direct.json)
+- [`results/producer-state/restarts.json`](../results/producer-state/restarts.json)
 
 ## Reproducing the measurements
 
 Full replay:
 
 ```bash
-PHASE2_REPLAY_COUNTS=10000,25000,50000,100000,250000 \
-  cargo test --release --locked --test phase2_replay \
+QLG_REPLAY_COUNTS=10000,25000,50000,100000,250000 \
+  cargo test --release --locked --test replay_benchmark \
   full_replay_benchmark -- --ignored --nocapture --test-threads=1
 ```
 
 Producer-state comparison:
 
 ```bash
-python scripts/phase2-producer-state.py
-python scripts/phase2_5-restart-state.py
+python scripts/measure-producer-state.py
+python scripts/measure-restart-producers.py
 ```

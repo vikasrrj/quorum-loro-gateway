@@ -123,10 +123,10 @@ struct ClusterGuard {
 impl ClusterGuard {
     fn start() -> anyhow::Result<Self> {
         let root = std::env::temp_dir()
-            .join(format!("qlg-phase2-{}", uuid::Uuid::new_v4()))
-            .join("phase2-cluster");
-        let output = Command::new(script("phase2-cluster-start.sh"))
-            .env("PHASE2_CLUSTER_ROOT", &root)
+            .join(format!("qlg-cluster-test-{}", uuid::Uuid::new_v4()))
+            .join("ursula-cluster");
+        let output = Command::new(script("ursula-cluster-start.sh"))
+            .env("QLG_CLUSTER_ROOT", &root)
             .output()
             .context("start three-node Ursula cluster")?;
         if !output.status.success() {
@@ -161,8 +161,8 @@ impl Drop for ClusterGuard {
                     .status();
             }
         }
-        let _ = Command::new(script("phase2-cluster-clean.sh"))
-            .env("PHASE2_CLUSTER_ROOT", &self.root)
+        let _ = Command::new(script("ursula-cluster-clean.sh"))
+            .env("QLG_CLUSTER_ROOT", &self.root)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -405,7 +405,7 @@ async fn acknowledged_update_survives_one_voter_and_gateway_crash() -> anyhow::R
     let url = format!("ws://{listen}/ws");
     let mut gateway = GatewayGuard::spawn(listen)?;
     let mut socket = connect_when_ready(&url).await?;
-    let room_id = format!("phase2-quorum-{}", uuid::Uuid::new_v4());
+    let room_id = format!("cluster-quorum-{}", uuid::Uuid::new_v4());
     join(&mut socket, &room_id).await?;
 
     send_protocol(
@@ -459,7 +459,7 @@ async fn one_voter_allows_writes_but_quorum_loss_never_acks() -> anyhow::Result<
     let url = format!("ws://{listen}/ws");
     let mut gateway = GatewayGuard::spawn(listen)?;
     let mut socket = connect_when_ready(&url).await?;
-    let room_id = format!("phase2-minority-{}", uuid::Uuid::new_v4());
+    let room_id = format!("cluster-minority-{}", uuid::Uuid::new_v4());
     join(&mut socket, &room_id).await?;
 
     anyhow::ensure!(
@@ -558,7 +558,7 @@ async fn leader_failure_before_append_never_advances_unresolved_sequence() -> an
     let url = format!("ws://{listen}/ws");
     let mut gateway = GatewayGuard::spawn(listen)?;
     let mut socket = connect_when_ready(&url).await?;
-    let room_id = format!("phase2-before-leader-{}", uuid::Uuid::new_v4());
+    let room_id = format!("cluster-before-leader-{}", uuid::Uuid::new_v4());
     join(&mut socket, &room_id).await?;
     let stream = delta_stream(&room_id).physical;
     let leader = leader_for_stream(&stream).await?;
@@ -602,7 +602,7 @@ async fn acknowledged_update_survives_current_leader_failure() -> anyhow::Result
     let url = format!("ws://{listen}/ws");
     let mut gateway = GatewayGuard::spawn(listen)?;
     let mut socket = connect_when_ready(&url).await?;
-    let room_id = format!("phase2-after-ack-{}", uuid::Uuid::new_v4());
+    let room_id = format!("cluster-after-ack-{}", uuid::Uuid::new_v4());
     join(&mut socket, &room_id).await?;
     anyhow::ensure!(
         submit_update(
@@ -675,7 +675,7 @@ async fn leader_failure_after_commit_before_response_requires_verified_duplicate
     let url = format!("ws://{listen}/ws");
     let mut gateway = GatewayGuard::spawn_with_base(listen, &format!("http://{proxy_address}"))?;
     let mut socket = connect_when_ready(&url).await?;
-    let room_id = format!("phase2-held-response-{}", uuid::Uuid::new_v4());
+    let room_id = format!("cluster-held-response-{}", uuid::Uuid::new_v4());
     join(&mut socket, &room_id).await?;
     let stream = delta_stream(&room_id).physical;
     let leader = leader_for_stream(&stream).await?;

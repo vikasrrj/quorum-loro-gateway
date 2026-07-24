@@ -19,7 +19,7 @@ NODE_URLS = [f"http://127.0.0.1:{port}" for port in (18101, 18102, 18103)]
 ADMIN_URLS = [f"http://127.0.0.1:{port}" for port in (18201, 18202, 18203)]
 ALLOWED_ORIGINS = {urllib.parse.urlsplit(url).netloc for url in NODE_URLS}
 STAGES = (0, 100, 1000, 5000)
-PAYLOAD = b"phase2-producer-state-payload-32"
+PAYLOAD = b"qlg-producer-state-payload-v1-00"
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -171,7 +171,7 @@ def append(stream, index, with_producer):
 
 def run_command(name, root):
     env = os.environ.copy()
-    env["PHASE2_CLUSTER_ROOT"] = str(root)
+    env["QLG_CLUSTER_ROOT"] = str(root)
     return subprocess.run(
         [str(REPO / "scripts" / name)],
         env=env,
@@ -188,7 +188,7 @@ def force_clean(root):
             os.kill(int(pid_file.read_text().strip()), 9)
         except (FileNotFoundError, ProcessLookupError, ValueError):
             pass
-    result = run_command("phase2-cluster-clean.sh", root)
+    result = run_command("ursula-cluster-clean.sh", root)
     if result.returncode != 0:
         raise RuntimeError(f"cluster cleanup failed: {result.stderr}")
     shutil.rmtree(root.parent, ignore_errors=True)
@@ -196,8 +196,8 @@ def force_clean(root):
 
 def run_workload(with_producer):
     mode = "producer" if with_producer else "control"
-    root = pathlib.Path(tempfile.mkdtemp(prefix=f"qlg-{mode}-")) / "phase2-cluster"
-    start = run_command("phase2-cluster-start.sh", root)
+    root = pathlib.Path(tempfile.mkdtemp(prefix=f"qlg-{mode}-")) / "ursula-cluster"
+    start = run_command("ursula-cluster-start.sh", root)
     if start.returncode != 0:
         raise RuntimeError(
             f"cluster start failed for {mode}:\n{start.stdout}\n{start.stderr}"
@@ -294,7 +294,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--output",
-        default=str(REPO / "results" / "phase2" / "producer-state.json"),
+        default=str(REPO / "results" / "producer-state" / "direct.json"),
     )
     args = parser.parse_args()
     output = pathlib.Path(args.output)

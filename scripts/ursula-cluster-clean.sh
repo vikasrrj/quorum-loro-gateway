@@ -2,12 +2,12 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cluster_root="${PHASE2_CLUSTER_ROOT:-${repo_root}/target/phase2-cluster}"
+cluster_root="${QLG_CLUSTER_ROOT:-${repo_root}/target/ursula-cluster}"
 
-"${repo_root}/scripts/phase2-cluster-stop.sh"
+"${repo_root}/scripts/ursula-cluster-stop.sh"
 
 case "${cluster_root}" in
-  "${repo_root}"/target/phase2-cluster|/tmp/*/phase2-cluster|/tmp/phase2-cluster)
+  "${repo_root}"/target/ursula-cluster|/tmp/*/ursula-cluster|/tmp/ursula-cluster)
     rm -rf "${cluster_root}"
     ;;
   *)

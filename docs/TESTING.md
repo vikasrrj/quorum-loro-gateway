@@ -14,7 +14,7 @@ The default suite covers frame parsing, protocol bounds, Loro validation, ACK ti
 
 ## What the local tests cover
 
-The main integration tests in `tests/phase1.rs` use deterministic in-memory storage to exercise the gateway logic without requiring Ursula.
+The main integration tests in `tests/gateway.rs` use deterministic in-memory storage to exercise the gateway logic without requiring Ursula.
 
 They check that:
 
@@ -38,7 +38,7 @@ The repository pins `loro-protocol@0.3.0` and `loro-crdt@1.13.7` for the JavaScr
 
 ```bash
 npm ci --prefix interop
-cargo test --test phase1 official_typescript_clients_converge \
+cargo test --test gateway official_typescript_clients_converge \
   -- --ignored --nocapture
 ```
 
@@ -49,7 +49,7 @@ This starts the Rust gateway and verifies bidirectional convergence with officia
 With Ursula running on `127.0.0.1:4437`:
 
 ```bash
-cargo test --test phase1 real_ursula_commit_duplicate_and_restart_replay \
+cargo test --test gateway real_ursula_commit_duplicate_and_restart_replay \
   -- --ignored --nocapture
 ```
 
@@ -71,26 +71,26 @@ The `crash-injection` feature exists only for this test boundary.
 The cluster scripts expect an Ursula release binary at `/home/vik/ursula/target/release/ursula`. Set `URSULA_BIN` to use another path.
 
 ```bash
-scripts/phase2-cluster-start.sh
-scripts/phase2-cluster-stop.sh
-scripts/phase2-cluster-clean.sh
+scripts/ursula-cluster-start.sh
+scripts/ursula-cluster-stop.sh
+scripts/ursula-cluster-clean.sh
 ```
 
 Run all cluster tests serially:
 
 ```bash
-cargo test --test phase2_cluster \
+cargo test --test cluster_failures \
   -- --ignored --nocapture --test-threads=1
 ```
 
-The important scenarios are:
+The cluster tests cover:
 
 ### One voter and gateway fail
 
 An update receives `Ack(Ok)`, one Ursula voter is killed, the gateway is killed, and a fresh gateway rebuilds the update from the two surviving voters.
 
 ```bash
-cargo test --test phase2_cluster \
+cargo test --test cluster_failures \
   acknowledged_update_survives_one_voter_and_gateway_crash \
   -- --ignored --nocapture
 ```
@@ -100,7 +100,7 @@ cargo test --test phase2_cluster \
 The tests kill the leader before submission, after commit but before the HTTP response reaches the gateway, and after the client receives `Ack(Ok)`.
 
 ```bash
-cargo test --test phase2_cluster leader_failure \
+cargo test --test cluster_failures leader_failure \
   -- --ignored --nocapture --test-threads=1
 ```
 
@@ -111,7 +111,7 @@ The post-commit case is the most important one: the retry reaches the new leader
 After one voter fails, writes still commit through the remaining majority. After a second voter fails, the next write never receives `Ack(Ok)` and later writes stay blocked behind the unresolved sequence.
 
 ```bash
-cargo test --test phase2_cluster \
+cargo test --test cluster_failures \
   one_voter_allows_writes_but_quorum_loss_never_acks \
   -- --ignored --nocapture
 ```

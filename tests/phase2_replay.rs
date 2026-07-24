@@ -610,6 +610,8 @@ fn summarize_count(cases: &[serde_json::Value], count: usize) -> anyhow::Result<
         "median_peak_rss_bytes": percentile_field(&matching, "peak_rss_bytes", 50),
         "p95_peak_rss_bytes": percentile_field(&matching, "peak_rss_bytes", 95),
         "median_peak_rss_delta_bytes": percentile_field(&matching, "peak_rss_delta_bytes", 50),
+        "median_vm_hwm_bytes": percentile_field(&matching, "post_activation_vm_hwm_bytes", 50),
+        "p95_vm_hwm_bytes": percentile_field(&matching, "post_activation_vm_hwm_bytes", 95),
         "reconstructed_state_sha256": hashes[0],
     }))
 }

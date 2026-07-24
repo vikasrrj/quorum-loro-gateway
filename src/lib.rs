@@ -4,6 +4,7 @@
 //! WebSocket and stores versioned update frames in one Ursula stream per room.
 
 pub mod actor;
+pub mod checkpoint;
 pub mod frame;
 pub mod names;
 pub mod protocol;

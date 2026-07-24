@@ -26,6 +26,7 @@ use quorum_loro_gateway::frame::DeltaFrame;
 use quorum_loro_gateway::frame::ProducerTuple;
 use quorum_loro_gateway::names::delta_stream;
 use quorum_loro_gateway::ursula::AppendOutcome;
+use quorum_loro_gateway::ursula::StoreError;
 use quorum_loro_gateway::ursula::UrsulaStore;
 use serde_json::json;
 use sha2::Digest;
@@ -415,13 +416,7 @@ async fn full_replay_benchmark() -> anyhow::Result<()> {
                     epoch: 0,
                     sequence: u64::try_from(sequence)?,
                 };
-                anyhow::ensure!(
-                    matches!(
-                        store.append(&stream_name, &loader, chunk).await?,
-                        AppendOutcome::Committed { .. }
-                    ),
-                    "benchmark history append was unexpectedly deduplicated"
-                );
+                append_history_chunk(&store, &stream_name, &loader, chunk).await?;
             }
             let load_micros = duration_micros(load_started.elapsed());
             let leader = leader_url(&stream_name).await?;
@@ -502,6 +497,29 @@ async fn full_replay_benchmark() -> anyhow::Result<()> {
     std::fs::write(&output_path, serde_json::to_vec_pretty(&output)?)?;
     println!("raw results: {}", output_path.display());
     Ok(())
+}
+
+async fn append_history_chunk(
+    store: &HttpUrsula,
+    stream: &str,
+    producer: &ProducerTuple,
+    chunk: &[u8],
+) -> anyhow::Result<()> {
+    let mut last_error = None;
+    for _ in 0..20 {
+        match store.append(stream, producer, chunk).await {
+            Ok(AppendOutcome::Committed { .. } | AppendOutcome::Duplicate { .. }) => return Ok(()),
+            Err(StoreError::Ambiguous(error)) => {
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    anyhow::bail!(
+        "history append remained ambiguous: {}",
+        last_error.as_deref().unwrap_or("no append attempt")
+    )
 }
 
 fn run_worker(

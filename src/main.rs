@@ -32,7 +32,7 @@ struct Args {
     ambiguous_retries: usize,
     #[arg(long, default_value_t = 3)]
     safe_read_retries: usize,
-    #[arg(long, default_value_t = 1_048_576)]
+    #[arg(long, default_value_t = 65_536)]
     ursula_read_chunk_bytes: usize,
     #[arg(long, default_value_t = 536_870_912)]
     max_room_history_bytes: usize,

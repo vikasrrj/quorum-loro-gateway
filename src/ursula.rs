@@ -83,7 +83,7 @@ impl Default for HttpUrsulaConfig {
             max_redirects: 4,
             bucket: "qloro".into(),
             response_timeout: Duration::from_secs(30),
-            read_chunk_bytes: 1024 * 1024,
+            read_chunk_bytes: 64 * 1024,
             max_stream_bytes: 512 * 1024 * 1024,
             safe_retries: 3,
             retry_base_delay: Duration::from_millis(25),

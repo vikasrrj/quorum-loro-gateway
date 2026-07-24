@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::Instant;
 
 use loro::EncodedBlobMode;
 use loro::ExportMode;
@@ -75,6 +76,10 @@ pub struct RoomStatus {
     pub pending_sequence: Option<u64>,
     pub peer_count: usize,
     pub last_error: Option<String>,
+    pub recovered_stream_bytes: usize,
+    pub recovered_update_count: usize,
+    pub recovery_total_micros: u64,
+    pub recovery_import_micros: u64,
 }
 
 #[derive(Clone)]
@@ -301,6 +306,10 @@ struct RoomActor {
     lifecycle: RoomLifecycle,
     last_error: Option<String>,
     status: Arc<Mutex<RoomStatus>>,
+    recovered_stream_bytes: usize,
+    recovered_update_count: usize,
+    recovery_total_micros: u64,
+    recovery_import_micros: u64,
     config: ActorConfig,
 }
 
@@ -322,6 +331,10 @@ impl RoomActor {
             pending_sequence: None,
             peer_count: 0,
             last_error: None,
+            recovered_stream_bytes: 0,
+            recovered_update_count: 0,
+            recovery_total_micros: 0,
+            recovery_import_micros: 0,
         }));
         Self {
             room_id,
@@ -336,6 +349,10 @@ impl RoomActor {
             lifecycle: RoomLifecycle::Recovering,
             last_error: None,
             status,
+            recovered_stream_bytes: 0,
+            recovered_update_count: 0,
+            recovery_total_micros: 0,
+            recovery_import_micros: 0,
             config,
         }
     }
@@ -382,6 +399,7 @@ impl RoomActor {
     }
 
     async fn initialize(&mut self) -> Result<(), InitializationFailure> {
+        let started = Instant::now();
         self.store
             .ensure_stream(&self.stream)
             .await
@@ -389,10 +407,11 @@ impl RoomActor {
         let (history, doc) = self.load_from_store().await?;
         self.history = history;
         self.doc = doc;
+        self.recovery_total_micros = duration_micros(started.elapsed());
         Ok(())
     }
 
-    async fn load_from_store(&self) -> Result<(Vec<Vec<u8>>, LoroDoc), InitializationFailure> {
+    async fn load_from_store(&mut self) -> Result<(Vec<Vec<u8>>, LoroDoc), InitializationFailure> {
         let bytes = self
             .store
             .read_all(&self.stream)
@@ -414,10 +433,14 @@ impl RoomActor {
             })?;
             history.extend(frame.updates);
         }
+        let import_started = Instant::now();
         let doc = replay(&history).map_err(|message| InitializationFailure {
             state: RoomLifecycle::Corrupt,
             message,
         })?;
+        self.recovered_stream_bytes = bytes.len();
+        self.recovered_update_count = history.len();
+        self.recovery_import_micros = duration_micros(import_started.elapsed());
         Ok((history, doc))
     }
 
@@ -480,6 +503,10 @@ impl RoomActor {
             .map(|pending| pending.producer.sequence);
         status.peer_count = self.peers.len();
         status.last_error.clone_from(&self.last_error);
+        status.recovered_stream_bytes = self.recovered_stream_bytes;
+        status.recovered_update_count = self.recovered_update_count;
+        status.recovery_total_micros = self.recovery_total_micros;
+        status.recovery_import_micros = self.recovery_import_micros;
     }
 
     fn join(&mut self, connection_id: u64, version: Vec<u8>, peer: PeerSender) {
@@ -853,6 +880,10 @@ fn initialization_store_failure(error: StoreError) -> InitializationFailure {
         state,
         message: error.to_string(),
     }
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 fn validate_update_blobs(updates: &[Vec<u8>], allow_snapshot: bool) -> Result<(), String> {

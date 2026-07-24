@@ -464,10 +464,18 @@ impl RoomActor {
             history.extend(frame.updates);
         }
         let import_started = Instant::now();
-        let doc = replay(&history).map_err(|message| InitializationFailure {
+        let replayed = replay(&history).map_err(|message| InitializationFailure {
             state: RoomLifecycle::Corrupt,
             message,
         })?;
+
+        tracing::debug!(
+            room = %self.room_id,
+            has_pending = replayed.has_pending,
+            "replayed durable room history"
+        );
+
+        let doc = replayed.doc;
         self.recovered_stream_bytes = bytes.len();
         self.recovered_update_count = history.len();
         self.recovery_import_micros = duration_micros(import_started.elapsed());
@@ -645,7 +653,14 @@ impl RoomActor {
         let mut candidate_history = self.history.clone();
         candidate_history.extend(updates.clone());
         let candidate = match replay(&candidate_history) {
-            Ok(doc) => doc,
+            Ok(replayed) => {
+                tracing::debug!(
+                    room = %self.room_id,
+                    has_pending = replayed.has_pending,
+                    "validated candidate room history"
+                );
+                replayed.doc
+            }
             Err(error) => {
                 warn!(room = %self.room_id, %error, "Loro import rejected");
                 send_ack(
@@ -951,13 +966,24 @@ fn validate_update_blobs(updates: &[Vec<u8>], allow_snapshot: bool) -> Result<()
     Ok(())
 }
 
-fn replay(updates: &[Vec<u8>]) -> Result<LoroDoc, String> {
+struct ReplayOutcome {
+    doc: LoroDoc,
+    has_pending: bool,
+}
+
+fn replay(updates: &[Vec<u8>]) -> Result<ReplayOutcome, String> {
     let doc = LoroDoc::new();
-    if !updates.is_empty() {
+
+    let has_pending = if updates.is_empty() {
+        false
+    } else {
         doc.import_batch(updates)
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(doc)
+            .map_err(|error| error.to_string())?
+            .pending
+            .is_some()
+    };
+
+    Ok(ReplayOutcome { doc, has_pending })
 }
 
 fn send_protocol(peer: &PeerSender, message: ProtocolMessage) {

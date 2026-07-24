@@ -2,7 +2,8 @@
 
 Phase 1.5 implements the official Loro Synchronization Protocol v1 over
 WebSocket and stores exact Loro blobs in one permanent Ursula delta stream per
-room. Only `%LOR` rooms are supported.
+room. Phase 2 validates that design against a real three-voter Ursula cluster.
+Only `%LOR` rooms are supported.
 
 This is a hardened prototype, not a production-ready service.
 
@@ -82,8 +83,8 @@ Operational endpoints:
 
 - `GET /healthz` is process liveness only.
 - `GET /debug/rooms` reports hashed stream name, lifecycle, producer sequence,
-  pending sequence, peer count, and last error. It never returns document or
-  frame bytes.
+  pending sequence, peer count, recovery byte/update counts and timings, and
+  last error. It never returns document or frame bytes.
 
 These endpoints have no authentication. Keep the service on a trusted network.
 
@@ -119,6 +120,23 @@ The real-Ursula acceptance test expects Ursula at `127.0.0.1:4437`:
 cargo test --test phase1 real_ursula_commit_duplicate_and_restart_replay -- --ignored --nocapture
 ```
 
+The Phase 2 harness starts isolated real Ursula and gateway processes for
+one-voter durability, quorum loss, and leader failure:
+
+```bash
+cargo test --test phase2_cluster \
+  acknowledged_update_survives_one_voter_and_gateway_crash \
+  -- --ignored --nocapture
+cargo test --test phase2_cluster \
+  one_voter_allows_writes_but_quorum_loss_never_acks \
+  -- --ignored --nocapture
+cargo test --test phase2_cluster leader_failure \
+  -- --ignored --nocapture --test-threads=1
+```
+
+Producer-state and release full-replay measurements, including raw results, are
+documented in `docs/PHASE_2.md`.
+
 ## Observability
 
 Structured append and reconciliation logs include the hashed stream, producer
@@ -143,10 +161,13 @@ Room states are:
 - In-memory fan-out only; no active-active or multi-gateway coordination.
 - No authentication, authorization, actor eviction, slow-consumer queue bound,
   or debug-endpoint access control.
-- Single Ursula endpoint behavior is tested; no quorum-loss or complete-cluster
-  disaster recovery guarantee is claimed.
+- Three-voter one-voter durability, quorum loss, and leader failure are tested;
+  no two-replica-loss or complete-cluster disaster recovery guarantee is
+  claimed.
 - No manifests, catalog, checkpoints, generation rotation, retention, DELETE,
   or later-phase lifecycle features.
 
 See `docs/INVESTIGATION.md` for dependency behavior and
 `docs/PHASE_1_5_AUDIT.md` for the pre-hardening audit and resolution record.
+See `docs/PHASE_2.md` for cluster topology, failure experiments, producer-state
+growth, and full-replay measurements.

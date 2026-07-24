@@ -22,6 +22,102 @@ fn import_without_pending(doc: &LoroDoc, bytes: &[u8]) {
 /// When that client returns, its causally old update must still merge correctly.
 /// Storage generation age must not become an event-time or causality cutoff.
 #[test]
+fn checkpoint_retains_only_raw_blobs_still_pending_against_snapshot() {
+    let source = LoroDoc::new();
+    source.set_peer_id(303).expect("set source peer");
+
+    let before_base = source.oplog_vv();
+
+    source
+        .get_text("text")
+        .insert(0, "base")
+        .expect("insert base");
+    source.commit();
+
+    let after_base = source.oplog_vv();
+    let base_update = source
+        .export(ExportMode::updates(&before_base))
+        .expect("export base update");
+
+    source
+        .get_text("text")
+        .insert(4, "-one")
+        .expect("insert first dependent update");
+    source.commit();
+
+    let after_first = source.oplog_vv();
+    let first_update = source
+        .export(ExportMode::updates(&after_base))
+        .expect("export first dependent update");
+
+    source
+        .get_text("text")
+        .insert(8, "-two")
+        .expect("insert second dependent update");
+    source.commit();
+
+    let second_update = source
+        .export(ExportMode::updates(&after_first))
+        .expect("export second dependent update");
+
+    // The base is applied, but the second update remains pending because
+    // the first dependent update is missing.
+    let live = LoroDoc::new();
+    let status = live
+        .import_batch(&[base_update.clone(), second_update.clone()])
+        .expect("import live history");
+
+    assert!(status.pending.is_some());
+    assert_eq!(live.get_text("text").to_string(), "base");
+
+    let snapshot = live
+        .export(ExportMode::Snapshot)
+        .expect("export checkpoint snapshot");
+
+    let history = vec![base_update.clone(), second_update.clone()];
+    let mut retained_pending_blobs: Vec<Vec<u8>> = Vec::new();
+
+    for blob in &history {
+        let probe = LoroDoc::from_snapshot(&snapshot).expect("restore checkpoint probe");
+
+        let probe_status = probe.import(blob).expect("probe historical update blob");
+
+        if probe_status.pending.is_some() {
+            retained_pending_blobs.push(blob.to_vec());
+        }
+    }
+
+    assert_eq!(
+        retained_pending_blobs,
+        vec![second_update.clone()],
+        "checkpoint should retain only the still-pending raw blob"
+    );
+
+    let recovered = LoroDoc::from_snapshot(&snapshot).expect("restore checkpoint");
+
+    let pending_status = recovered
+        .import_batch(&retained_pending_blobs)
+        .expect("restore retained pending blobs");
+
+    assert!(pending_status.pending.is_some());
+
+    let resolved_status = recovered
+        .import(&first_update)
+        .expect("import missing dependency");
+
+    assert!(resolved_status.pending.is_none());
+    assert_eq!(recovered.get_text("text").to_string(), "base-one-two");
+
+    let control = LoroDoc::new();
+    let control_status = control
+        .import_batch(&[base_update, second_update, first_update])
+        .expect("build control document");
+
+    assert!(control_status.pending.is_none());
+    assert_eq!(recovered.get_deep_value(), control.get_deep_value());
+    assert_eq!(recovered.oplog_vv(), control.oplog_vv());
+}
+#[test]
 fn snapshot_accepts_update_from_client_offline_before_checkpoint() {
     // Initial shared state.
     let initial = new_doc(1);

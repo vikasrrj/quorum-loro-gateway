@@ -108,6 +108,3 @@ More detailed design notes, failure tests, and benchmark results are available i
 Then commit it manually:
 
 ```bash
-git add README.md
-git commit -m "Simplify README"
-git push origin main

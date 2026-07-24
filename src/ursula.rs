@@ -804,21 +804,34 @@ mod tests {
     #[tokio::test]
     async fn response_body_is_covered_by_timeout() {
         let router = Router::new().fallback(any(|| async {
-            let stream = futures_util::stream::once(async {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                Ok::<_, Infallible>(Bytes::from_static(b"a"))
+            let stream = futures_util::stream::unfold(0_u8, |state| async move {
+                match state {
+                    0 => Some((Ok::<_, Infallible>(Bytes::from_static(b"a")), 1)),
+                    _ => {
+                        std::future::pending::<()>().await;
+                        None
+                    }
+                }
             });
-            read_response(StatusCode::OK, 1, Body::from_stream(stream))
+
+            read_response(StatusCode::OK, 2, Body::from_stream(stream))
         }));
+
         let store = serve(router, |config| {
-            config.response_timeout = Duration::from_millis(5);
+            config.response_timeout = Duration::from_millis(500);
         })
         .await;
 
-        assert!(matches!(
-            store.read_all("stream").await,
-            Err(StoreError::Ambiguous(message)) if message.contains("body timeout")
-        ));
+        let result = store.read_all("stream").await;
+
+        assert!(
+            matches!(
+                &result,
+                Err(StoreError::Ambiguous(message))
+                    if message.contains("body timeout")
+            ),
+            "unexpected result: {result:?}"
+        );
     }
 
     async fn retry_handler(State(attempts): State<Arc<AtomicUsize>>) -> Response {

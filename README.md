@@ -1,179 +1,113 @@
 # Quorum Loro Gateway
 
-Phase 1.5 implements the official Loro Synchronization Protocol v1 over
-WebSocket and stores exact Loro blobs in one permanent Ursula delta stream per
-room. Phase 2 validates that design against a real three-voter Ursula cluster.
-Only `%LOR` rooms are supported.
+A self-hosted Loro sync server backed by Ursula durable streams.
 
-This is a hardened prototype, not a production-ready service.
+The gateway accepts Loro updates over WebSocket, stores the exact update bytes in Ursula, and returns `Ack(Ok)` only after the write is durably committed or a previous duplicate commit is verified.
 
-## Durable ACK Guarantee
+This is currently a hardened prototype.
 
-`Ack(Ok)` has one construction path. It requires one of two internal proofs:
+## How it works
 
-- `Committed`: Ursula returned an explicit successful append result.
-- `VerifiedDuplicate`: Ursula reported the producer tuple as a duplicate, and
-  the gateway derived the candidate range with checked subtraction, read the
-  exact expected byte count, compared every stored byte to the retained frame,
-  decoded exactly one checksum-valid frame, and compared the full decoded
-  frame including producer tuple, batch ID, updates, and digest.
+```text
+Loro client
+    ↓ WebSocket
+Quorum Loro Gateway
+    ↓ durable append
+Ursula quorum-backed stream
+    ↓ commit confirmed
+Ack(Ok)
 
-Timeouts, transport failures, 5xx responses, malformed responses, exhausted
-retries, offset inconsistencies, and failed duplicate verification never map to
-`Ack(Ok)`. One room actor serializes appends and advances its producer sequence
-only after one of the durable proofs above.
+Loro handles CRDT merging and offline edits.
 
-When an append remains ambiguous, the exact tuple and frame bytes are retained,
-the room enters `append_ambiguous`, and both joins and writes fail closed. A
-controlled `RoomHandle::retry_ambiguous` or `RoomManager::retry_ambiguous`
-attempt reuses those exact values. Returning to `ready` additionally requires a
-complete authoritative reload from Ursula.
+Ursula handles durable ordering, replication, and replay.
 
-## Durable Frame
+The gateway connects them and controls when an update is acknowledged.
 
-Each append is one versioned `QLGD` frame containing:
+Current version
 
-- frame magic, version, flags, and duplicated total length;
-- producer ID, epoch, and sequence;
-- official protocol batch ID;
-- count and lengths of the exact received Loro blobs;
-- exact blob bytes without decode/re-encode transformation;
-- SHA-256 domain-separated update digest;
-- CRC32 over the frame body.
+The current version supports:
 
-Recovery starts at stream offset zero and decodes every frame in order. It
-rejects unsupported versions, bad magic or flags, truncation, trailing bytes,
-checksum/digest failures, invalid Loro blobs, snapshot-policy violations, and
-contextual import failures. Frame errors identify the durable stream offset.
-No malformed frame or Loro update is skipped.
+Loro Synchronization Protocol v1
+%LOR rooms
+official Rust and TypeScript clients
+normal and fragmented Loro updates
+exact update-byte storage
+durable Ack(Ok)
+producer retry and duplicate verification
+gateway crash recovery
+complete room reconstruction from Ursula
+corruption and malformed-frame detection
+Ursula leader redirects
+tested three-voter quorum behavior
+one-voter and leader failure testing
+health and room debug endpoints
 
-Frame, producer ID, update count, individual update, aggregate update, complete
-history, WebSocket message, fragment batch, fragment count, reassembled update,
-per-connection fragment bytes, HTTP response body, and HTTP timing are bounded.
-The binary exposes the principal limits as command-line flags; library users can
-configure `FrameLimits`, `ProtocolLimits`, `ServerConfig`, and
-`HttpUrsulaConfig` directly.
+The gateway does not need its own local durable database. It rebuilds room state from Ursula after restarting.
 
-## Loro Policy
+Durability guarantee
 
-- Updates are checksum-checked and contextually imported into an isolated
-  document before storage.
-- One full snapshot is accepted only as the sole blob initializing a room with
-  no durable history. This preserves the official empty-receiver flow.
-- Full snapshot replacement, shallow snapshots, outdated encodings, empty
-  batches, malformed blobs, and unresolved dependency imports are rejected
-  before storage.
-- Authoritative in-memory state changes only after durable append proof. If
-  reconciliation after an already committed ambiguous append fails, the frame
-  remains durable and the room stays fail-closed until Ursula reload succeeds.
+Ack(Ok) means the exact update frame was committed to Ursula, or an already committed retry was read back and verified byte-for-byte.
 
-## Run
+Timeouts, transport failures, malformed responses, failed duplicate verification, and uncertain writes never return Ack(Ok).
 
-Start a local Ursula server, then run:
+When the gateway cannot determine whether a write committed, the room fails closed until the write is safely resolved.
 
-```bash
+Current storage model
+
+Each room currently uses one append-only Ursula stream.
+
+On startup, the gateway replays the full stream to rebuild the Loro document.
+
+Measured replay results:
+
+Updates	History size	p95 activation
+10,000	1.94 MiB	237 ms
+50,000	9.78 MiB	912 ms
+100,000	19.61 MiB	1.90 s
+250,000	49.08 MiB	4.82 s
+
+These results suggest checkpointing becomes useful as room history grows.
+
+Run
+
+Start Ursula locally, then run:
+
 cargo run -- \
   --listen 127.0.0.1:8080 \
   --ursula-url http://127.0.0.1:4437
-```
 
-Connect an official protocol v1 client to `ws://127.0.0.1:8080/ws`.
+Connect a Loro client to:
 
-Operational endpoints:
+ws://127.0.0.1:8080/ws
 
-- `GET /healthz` is process liveness only.
-- `GET /debug/rooms` reports hashed stream name, lifecycle, producer sequence,
-  pending sequence, peer count, recovery byte/update counts and timings, and
-  last error. It never returns document or frame bytes.
+Run the standard checks:
 
-These endpoints have no authentication. Keep the service on a trusted network.
-
-## Verification
-
-Required local gates:
-
-```bash
 cargo fmt --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
-```
+Main limitations
+full room history is replayed after restart
+no checkpoints or stream rotation yet
+one permanent stream per room
+no authentication or authorization
+no safe multi-gateway writing
+no retention or cleanup system
+no complete-cluster disaster recovery guarantee
+not production-ready
+Remaining work
 
-Official TypeScript/JavaScript interoperability uses pinned
-`loro-protocol@0.3.0` and `loro-crdt@1.13.7` clients:
+The next major step is bounded recovery using checkpoints and stream generations.
 
-```bash
-npm ci --prefix interop
-cargo test --test phase1 official_typescript_clients_converge -- --ignored --nocapture
-```
+Later work includes authentication, retention, multi-gateway coordination, actor cleanup, slow-client limits, and larger production-style testing.
 
-The genuine process-crash harness enables only the test injection feature,
-aborts a gateway child after Ursula commit and before ACK, then starts a fresh
-child and verifies Ursula-only recovery:
+Detailed documentation
 
-```bash
-cargo test --features crash-injection --test process_crash -- --ignored --nocapture
-```
+More detailed design notes, failure tests, and benchmark results are available in the docs directory.
 
-The real-Ursula acceptance test expects Ursula at `127.0.0.1:4437`:
 
-```bash
-cargo test --test phase1 real_ursula_commit_duplicate_and_restart_replay -- --ignored --nocapture
-```
-
-The Phase 2 harness starts isolated real Ursula and gateway processes for
-one-voter durability, quorum loss, and leader failure:
+Then commit it manually:
 
 ```bash
-cargo test --test phase2_cluster \
-  acknowledged_update_survives_one_voter_and_gateway_crash \
-  -- --ignored --nocapture
-cargo test --test phase2_cluster \
-  one_voter_allows_writes_but_quorum_loss_never_acks \
-  -- --ignored --nocapture
-cargo test --test phase2_cluster leader_failure \
-  -- --ignored --nocapture --test-threads=1
-```
-
-Producer-state and release full-replay measurements, including raw results, are
-documented in `docs/PHASE_2.md`.
-
-The isolated Phase 2.5 scale study extends full replay through 250,000 updates,
-records component timings and state hashes, and derives its checkpoint decision
-from an explicit p95 recovery SLO. See `docs/PHASE_2_5_SCALE.md`.
-
-## Observability
-
-Structured append and reconciliation logs include the hashed stream, producer
-ID/epoch/sequence, retry number, result class, committed offset or duplicate
-range, and reconciliation result. Room lifecycle transitions include producer
-and pending sequence state.
-
-Room states are:
-
-- `recovering`: activation is replaying Ursula; commands remain queued.
-- `ready`: authoritative replay/install succeeded; joins and writes are allowed.
-- `append_ambiguous`: one exact append is unresolved; joins and writes fail.
-- `corrupt`: durable bytes, frame policy, or Loro replay failed integrity checks.
-- `unavailable`: Ursula or reconciliation is unavailable or definitely unsafe.
-
-## Non-Production Boundaries
-
-- One permanent, unbounded logical delta history per room. Configured byte
-  limits fail closed; there is no checkpoint or compaction path.
-- Full replay and candidate validation are O(history), and active actors retain
-  raw history in memory.
-- In-memory fan-out only; no active-active or multi-gateway coordination.
-- No authentication, authorization, actor eviction, slow-consumer queue bound,
-  or debug-endpoint access control.
-- Three-voter one-voter durability, quorum loss, and leader failure are tested;
-  no two-replica-loss or complete-cluster disaster recovery guarantee is
-  claimed.
-- No manifests, catalog, checkpoints, generation rotation, retention, DELETE,
-  or later-phase lifecycle features.
-
-See `docs/INVESTIGATION.md` for dependency behavior and
-`docs/PHASE_1_5_AUDIT.md` for the pre-hardening audit and resolution record.
-See `docs/PHASE_2.md` for cluster topology, failure experiments, producer-state
-growth, and full-replay measurements.
-See `docs/PHASE_2_5_SCALE.md` for the measured full-replay scaling and checkpoint
-decision.
+git add README.md
+git commit -m "Simplify README"
+git push origin main

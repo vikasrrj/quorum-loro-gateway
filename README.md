@@ -137,6 +137,10 @@ cargo test --test phase2_cluster leader_failure \
 Producer-state and release full-replay measurements, including raw results, are
 documented in `docs/PHASE_2.md`.
 
+The isolated Phase 2.5 scale study extends full replay through 250,000 updates,
+records component timings and state hashes, and derives its checkpoint decision
+from an explicit p95 recovery SLO. See `docs/PHASE_2_5_SCALE.md`.
+
 ## Observability
 
 Structured append and reconciliation logs include the hashed stream, producer
@@ -171,3 +175,5 @@ See `docs/INVESTIGATION.md` for dependency behavior and
 `docs/PHASE_1_5_AUDIT.md` for the pre-hardening audit and resolution record.
 See `docs/PHASE_2.md` for cluster topology, failure experiments, producer-state
 growth, and full-replay measurements.
+See `docs/PHASE_2_5_SCALE.md` for the measured full-replay scaling and checkpoint
+decision.

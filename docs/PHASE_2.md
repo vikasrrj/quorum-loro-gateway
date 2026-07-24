@@ -236,11 +236,7 @@ The raw results record Linux 6.19.11, Ursula revision
 
 ### Checkpoint recommendation
 
-Phase 2 deliberately leaves checkpointing unimplemented. Before production,
-add a measured checkpoint/compaction design rather than relying on an unbounded
-permanent delta stream. A conservative initial trigger for this update shape is
-the earlier of 10,000 updates or 2 MiB of encoded stream history, where local
-activation reached approximately 174 ms. That trigger is a starting point, not
-a universal threshold: tune it against the deployment's recovery SLO, update
-sizes, storage latency, and concurrent room load. Until then, configured history
-limits must continue to fail closed.
+Phase 2.5 supersedes the preliminary 10,000-update / 2-MiB suggestion with
+isolated measurements through 250,000 updates and an explicit recovery SLO. See
+`docs/PHASE_2_5_SCALE.md`. No checkpointing is implemented in Phase 2 or 2.5;
+configured history limits must continue to fail closed.

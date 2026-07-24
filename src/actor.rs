@@ -79,6 +79,9 @@ pub struct RoomStatus {
     pub recovered_stream_bytes: usize,
     pub recovered_update_count: usize,
     pub recovery_total_micros: u64,
+    pub recovery_read_micros: u64,
+    pub recovery_read_requests: u64,
+    pub recovery_decode_micros: u64,
     pub recovery_import_micros: u64,
 }
 
@@ -232,6 +235,16 @@ impl RoomHandle {
             .clone()
     }
 
+    pub async fn wait_for_activation(&self) -> Option<RoomStatus> {
+        let (response, result) = oneshot::channel();
+        self.tx
+            .send(Command::WaitForActivation { response })
+            .await
+            .ok()?;
+        result.await.ok()?;
+        Some(self.status())
+    }
+
     pub async fn retry_ambiguous(&self) -> bool {
         let (response, result) = oneshot::channel();
         if self
@@ -263,6 +276,9 @@ enum Command {
     },
     RetryAmbiguous {
         response: oneshot::Sender<bool>,
+    },
+    WaitForActivation {
+        response: oneshot::Sender<()>,
     },
 }
 
@@ -309,6 +325,9 @@ struct RoomActor {
     recovered_stream_bytes: usize,
     recovered_update_count: usize,
     recovery_total_micros: u64,
+    recovery_read_micros: u64,
+    recovery_read_requests: u64,
+    recovery_decode_micros: u64,
     recovery_import_micros: u64,
     config: ActorConfig,
 }
@@ -334,6 +353,9 @@ impl RoomActor {
             recovered_stream_bytes: 0,
             recovered_update_count: 0,
             recovery_total_micros: 0,
+            recovery_read_micros: 0,
+            recovery_read_requests: 0,
+            recovery_decode_micros: 0,
             recovery_import_micros: 0,
         }));
         Self {
@@ -352,6 +374,9 @@ impl RoomActor {
             recovered_stream_bytes: 0,
             recovered_update_count: 0,
             recovery_total_micros: 0,
+            recovery_read_micros: 0,
+            recovery_read_requests: 0,
+            recovery_decode_micros: 0,
             recovery_import_micros: 0,
             config,
         }
@@ -364,6 +389,9 @@ impl RoomActor {
         }
         while let Some(command) = rx.recv().await {
             match command {
+                Command::WaitForActivation { response } => {
+                    let _ = response.send(());
+                }
                 Command::RetryAmbiguous { response } => {
                     let _ = response.send(self.retry_pending().await);
                 }
@@ -412,16 +440,18 @@ impl RoomActor {
     }
 
     async fn load_from_store(&mut self) -> Result<(Vec<Vec<u8>>, LoroDoc), InitializationFailure> {
-        let bytes = self
-            .store
-            .read_all(&self.stream)
-            .await
-            .map_err(initialization_store_failure)?;
-        let frames = decode_all_with_limits(&bytes, self.config.frame_limits).map_err(|error| {
-            InitializationFailure {
-                state: RoomLifecycle::Corrupt,
-                message: error.to_string(),
-            }
+        let read_started = Instant::now();
+        let observation = self.store.read_all_observed(&self.stream).await;
+        self.recovery_read_micros = duration_micros(read_started.elapsed());
+        let observation = observation.map_err(initialization_store_failure)?;
+        self.recovery_read_requests = observation.request_count;
+        let bytes = observation.bytes;
+        let decode_started = Instant::now();
+        let frames = decode_all_with_limits(&bytes, self.config.frame_limits);
+        self.recovery_decode_micros = duration_micros(decode_started.elapsed());
+        let frames = frames.map_err(|error| InitializationFailure {
+            state: RoomLifecycle::Corrupt,
+            message: error.to_string(),
         })?;
         let mut history = Vec::new();
         for frame in frames {
@@ -470,6 +500,9 @@ impl RoomActor {
             Command::RetryAmbiguous { response } => {
                 let _ = response.send(false);
             }
+            Command::WaitForActivation { response } => {
+                let _ = response.send(());
+            }
         }
     }
 
@@ -506,6 +539,9 @@ impl RoomActor {
         status.recovered_stream_bytes = self.recovered_stream_bytes;
         status.recovered_update_count = self.recovered_update_count;
         status.recovery_total_micros = self.recovery_total_micros;
+        status.recovery_read_micros = self.recovery_read_micros;
+        status.recovery_read_requests = self.recovery_read_requests;
+        status.recovery_decode_micros = self.recovery_decode_micros;
         status.recovery_import_micros = self.recovery_import_micros;
     }
 

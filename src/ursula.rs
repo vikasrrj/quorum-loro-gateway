@@ -1,4 +1,6 @@
 use std::collections::HashSet;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -43,10 +45,22 @@ pub enum StoreError {
     Integrity(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadAllObservation {
+    pub bytes: Vec<u8>,
+    pub request_count: u64,
+}
+
 #[async_trait]
 pub trait UrsulaStore: Send + Sync {
     async fn ensure_stream(&self, stream: &str) -> Result<(), StoreError>;
     async fn read_all(&self, stream: &str) -> Result<Vec<u8>, StoreError>;
+    async fn read_all_observed(&self, stream: &str) -> Result<ReadAllObservation, StoreError> {
+        Ok(ReadAllObservation {
+            bytes: self.read_all(stream).await?,
+            request_count: 1,
+        })
+    }
     async fn read_range(
         &self,
         stream: &str,
@@ -326,9 +340,13 @@ impl HttpUrsula {
         stream: &str,
         offset: u64,
         max_bytes: usize,
+        request_count: &AtomicU64,
     ) -> Result<(Vec<u8>, u64, bool), StoreError> {
         for attempt in 0..=self.config.safe_retries {
-            match self.read_exact_window_once(stream, offset, max_bytes).await {
+            match self
+                .read_exact_window_once(stream, offset, max_bytes, request_count)
+                .await
+            {
                 Err(StoreError::Ambiguous(_)) if attempt < self.config.safe_retries => {
                     self.retry_sleep(attempt).await;
                 }
@@ -351,6 +369,7 @@ impl HttpUrsula {
         stream: &str,
         offset: u64,
         max_bytes: usize,
+        request_count: &AtomicU64,
     ) -> Result<(Vec<u8>, u64, bool), StoreError> {
         let mut url = self.stream_url(stream)?;
         url.query_pairs_mut()
@@ -358,6 +377,7 @@ impl HttpUrsula {
             .append_pair("max_bytes", &max_bytes.to_string());
         let response = self
             .send_following_redirects("read stream", url, &|target| {
+                request_count.fetch_add(1, Ordering::Relaxed);
                 self.client.get(target.clone())
             })
             .await?;
@@ -431,11 +451,16 @@ impl UrsulaStore for HttpUrsula {
     }
 
     async fn read_all(&self, stream: &str) -> Result<Vec<u8>, StoreError> {
+        Ok(self.read_all_observed(stream).await?.bytes)
+    }
+
+    async fn read_all_observed(&self, stream: &str) -> Result<ReadAllObservation, StoreError> {
         let mut output = Vec::new();
         let mut offset = 0_u64;
+        let request_count = AtomicU64::new(0);
         loop {
             let (body, next_offset, up_to_date) = self
-                .read_exact_window(stream, offset, self.config.read_chunk_bytes)
+                .read_exact_window(stream, offset, self.config.read_chunk_bytes, &request_count)
                 .await?;
             if next_offset < offset || (next_offset == offset && !up_to_date) {
                 return Err(StoreError::Integrity("read made no offset progress".into()));
@@ -453,7 +478,10 @@ impl UrsulaStore for HttpUrsula {
             output.extend_from_slice(&body);
             offset = next_offset;
             if up_to_date {
-                return Ok(output);
+                return Ok(ReadAllObservation {
+                    bytes: output,
+                    request_count: request_count.load(Ordering::Relaxed),
+                });
             }
         }
     }
@@ -469,9 +497,12 @@ impl UrsulaStore for HttpUrsula {
         }
         let mut output = Vec::with_capacity(length);
         let mut next = offset;
+        let request_count = AtomicU64::new(0);
         while output.len() < length {
             let remaining = length - output.len();
-            let (body, returned_next, _) = self.read_exact_window(stream, next, remaining).await?;
+            let (body, returned_next, _) = self
+                .read_exact_window(stream, next, remaining, &request_count)
+                .await?;
             if returned_next <= next || body.is_empty() {
                 return Err(StoreError::Integrity(
                     "committed range ended before expected frame length".into(),
@@ -808,7 +839,9 @@ mod tests {
             .with_state(attempts.clone());
         let store = serve(router, |config| config.safe_retries = 1).await;
 
-        assert_eq!(store.read_all("stream").await.expect("retry read"), b"ok");
+        let observation = store.read_all_observed("stream").await.expect("retry read");
+        assert_eq!(observation.bytes, b"ok");
+        assert_eq!(observation.request_count, 2);
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 

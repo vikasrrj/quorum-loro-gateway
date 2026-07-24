@@ -1,3 +1,6 @@
+use loro::ExportMode;
+use loro::LoroDoc;
+
 use crc32fast::Hasher as Crc32;
 use sha2::Digest;
 use sha2::Sha256;
@@ -458,7 +461,73 @@ fn take_until<'a>(
     }
     take(input, cursor, length)
 }
+pub fn build_checkpoint_record(
+    room_id: &str,
+    checkpoint_generation: u64,
+    source_delta_generation: u64,
+    source_delta_end_offset: u64,
+    doc: &LoroDoc,
+    history: &[Vec<u8>],
+) -> Result<CheckpointRecord, CheckpointBuildError> {
+    let snapshot = doc
+        .export(ExportMode::Snapshot)
+        .map_err(|error| CheckpointBuildError::SnapshotExport(error.to_string()))?;
 
+    let mut pending_updates = Vec::new();
+
+    for update in history {
+        let probe = LoroDoc::from_snapshot(&snapshot)
+            .map_err(|error| CheckpointBuildError::SnapshotRestore(error.to_string()))?;
+
+        let status = probe
+            .import(update)
+            .map_err(|error| CheckpointBuildError::HistoryImport(error.to_string()))?;
+
+        if status.pending.is_some() {
+            pending_updates.push(update.clone());
+        }
+    }
+
+    let recovered = LoroDoc::from_snapshot(&snapshot)
+        .map_err(|error| CheckpointBuildError::SnapshotRestore(error.to_string()))?;
+
+    if !pending_updates.is_empty() {
+        recovered
+            .import_batch(&pending_updates)
+            .map_err(|error| CheckpointBuildError::HistoryImport(error.to_string()))?;
+    }
+
+    if recovered.get_deep_value() != doc.get_deep_value() || recovered.oplog_vv() != doc.oplog_vv()
+    {
+        return Err(CheckpointBuildError::Validation(
+            "snapshot plus retained updates does not reconstruct the live document",
+        ));
+    }
+
+    Ok(CheckpointRecord::new(
+        room_id,
+        checkpoint_generation,
+        source_delta_generation,
+        source_delta_end_offset,
+        snapshot,
+        pending_updates,
+    ))
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum CheckpointBuildError {
+    #[error("failed to export checkpoint snapshot: {0}")]
+    SnapshotExport(String),
+
+    #[error("failed to restore checkpoint snapshot: {0}")]
+    SnapshotRestore(String),
+
+    #[error("failed to import historical update while building checkpoint: {0}")]
+    HistoryImport(String),
+
+    #[error("checkpoint construction validation failed: {0}")]
+    Validation(&'static str),
+}
 #[cfg(test)]
 mod tests {
     use super::*;

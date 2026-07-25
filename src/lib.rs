@@ -13,6 +13,7 @@ pub mod manifest_store;
 pub mod names;
 pub mod protocol;
 pub mod recovery;
+pub mod rotation;
 pub mod server;
 pub mod ursula;
 

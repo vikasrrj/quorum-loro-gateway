@@ -283,6 +283,7 @@ enum Command {
 }
 
 struct PendingAppend {
+    target_stream: String,
     producer: ProducerTuple,
     frame: DeltaFrame,
     bytes: Vec<u8>,
@@ -697,6 +698,7 @@ impl RoomActor {
             }
         };
         let pending = PendingAppend {
+            target_stream: self.stream.clone(),
             producer: producer.clone(),
             frame,
             bytes: bytes.clone(),
@@ -813,7 +815,7 @@ impl RoomActor {
             );
             match self
                 .store
-                .append(&self.stream, &pending.producer, &pending.bytes)
+                .append(&pending.target_stream, &pending.producer, &pending.bytes)
                 .await
             {
                 Ok(AppendOutcome::Committed { next_offset }) => {
@@ -854,14 +856,13 @@ impl RoomActor {
                     );
                     let stored = self
                         .store
-                        .read_range(&self.stream, start, frame_len)
+                        .read_range(&pending.target_stream, start, frame_len)
                         .await
                         .map_err(AppendFailure::OutcomeUnknown)?;
                     verify_duplicate_bytes(pending, &stored, self.config.frame_limits)
                         .map_err(AppendFailure::OutcomeUnknown)?;
                     tracing::info!(
-                        stream = %self.stream,
-                        producer_id = %pending.producer.id,
+                        stream = %pending.target_stream,                        producer_id = %pending.producer.id,
                         producer_epoch = pending.producer.epoch,
                         producer_sequence = pending.producer.sequence,
                         retry = attempts,

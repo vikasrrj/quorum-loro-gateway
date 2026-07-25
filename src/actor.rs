@@ -18,6 +18,7 @@ use loro_protocol::ProtocolMessage;
 use loro_protocol::RoomErrorCode;
 use loro_protocol::UpdateStatusCode;
 use serde::Serialize;
+
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tracing::error;
@@ -670,29 +671,32 @@ impl RoomActor {
             );
             return;
         }
-
-        let mut candidate_history = self.history.clone();
-        candidate_history.extend(updates.clone());
-        let candidate = match replay(&candidate_history) {
+        let candidate = match build_candidate(&self.doc, &self.history, &updates) {
             Ok(replayed) => {
                 tracing::debug!(
                     room = %self.room_id,
                     has_pending = replayed.has_pending,
-                    "validated candidate room history"
+                    "validated candidate room state"
                 );
+
                 replayed.doc
             }
             Err(error) => {
                 warn!(room = %self.room_id, %error, "Loro import rejected");
+
                 send_ack(
                     &peer,
                     &self.room_id,
                     batch_id,
                     UpdateStatusCode::InvalidUpdate,
                 );
+
                 return;
             }
         };
+
+        let mut candidate_history = self.history.clone();
+        candidate_history.extend(updates.clone());
         let producer = ProducerTuple {
             id: self.producer_id.clone(),
             epoch: 0,
@@ -993,6 +997,37 @@ fn validate_update_blobs(updates: &[Vec<u8>], allow_snapshot: bool) -> Result<()
 struct ReplayOutcome {
     doc: LoroDoc,
     has_pending: bool,
+}
+fn build_candidate(
+    current_doc: &LoroDoc,
+    retained_history: &[Vec<u8>],
+    new_updates: &[Vec<u8>],
+) -> Result<ReplayOutcome, String> {
+    let snapshot = current_doc
+        .export(ExportMode::Snapshot)
+        .map_err(|error| error.to_string())?;
+
+    let candidate = LoroDoc::from_snapshot(&snapshot).map_err(|error| error.to_string())?;
+
+    let mut updates = Vec::with_capacity(retained_history.len() + new_updates.len());
+
+    updates.extend(retained_history.iter().cloned());
+    updates.extend(new_updates.iter().cloned());
+
+    let has_pending = if updates.is_empty() {
+        false
+    } else {
+        candidate
+            .import_batch(&updates)
+            .map_err(|error| error.to_string())?
+            .pending
+            .is_some()
+    };
+
+    Ok(ReplayOutcome {
+        doc: candidate,
+        has_pending,
+    })
 }
 
 fn replay(updates: &[Vec<u8>]) -> Result<ReplayOutcome, String> {

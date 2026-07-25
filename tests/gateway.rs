@@ -1190,6 +1190,71 @@ async fn fragments_reassemble_out_of_order_and_reject_conflicting_duplicates() {
 }
 
 #[tokio::test]
+async fn rotation_recovers_checkpoint_and_new_delta_after_restart() {
+    let source = LoroDoc::new();
+    source.set_peer_id(88).expect("set source peer");
+
+    let before_first = source.oplog_vv();
+
+    source
+        .get_text("text")
+        .insert(0, "before")
+        .expect("insert before rotation");
+    source.commit();
+
+    let after_first = source.oplog_vv();
+
+    let first_update = source
+        .export(ExportMode::updates(&before_first))
+        .expect("export first update");
+
+    source
+        .get_text("text")
+        .insert(6, "-after")
+        .expect("insert after rotation");
+    source.commit();
+
+    let second_update = source
+        .export(ExportMode::updates(&after_first))
+        .expect("export second update");
+
+    let store = MemoryStore::new();
+    let first = manager(store.clone(), 40);
+
+    let (room, tx, mut rx) = joined_room(&first, "rotation-restart", 1).await;
+
+    room.update(1, BatchId([40; 8]), vec![first_update], tx.clone())
+        .await;
+
+    assert_eq!(recv_ack(&mut rx).await, UpdateStatusCode::Ok);
+
+    assert!(room.rotate().await, "room rotation failed");
+
+    room.update(1, BatchId([41; 8]), vec![second_update], tx)
+        .await;
+
+    assert_eq!(recv_ack(&mut rx).await, UpdateStatusCode::Ok);
+
+    drop(room);
+    drop(first);
+
+    let restarted = manager(store, 41);
+
+    let (_room, _tx, mut restarted_rx) = joined_room(&restarted, "rotation-restart", 2).await;
+
+    let updates = doc_updates(recv_protocol(&mut restarted_rx).await)
+        .expect("expected bounded recovery backfill");
+
+    let recovered = LoroDoc::new();
+
+    recovered
+        .import_batch(&updates)
+        .expect("import bounded recovery backfill");
+
+    assert_eq!(recovered.get_text("text").to_string(), "before-after");
+}
+
+#[tokio::test]
 async fn oversized_committed_live_update_is_fragmented_for_subscribers() {
     let mut value = 0x1234_5678_u64;
     let text = (0..600_000)

@@ -27,6 +27,7 @@ use crate::frame::DeltaFrame;
 use crate::frame::FrameLimits;
 use crate::frame::ProducerTuple;
 use crate::frame::decode_all_with_limits;
+use crate::names::GenerationId;
 use crate::names::delta_stream;
 use crate::names::producer_id;
 use crate::ursula::AppendOutcome;
@@ -295,6 +296,16 @@ enum DurableAppend {
     VerifiedDuplicate { next_offset: u64 },
 }
 
+impl DurableAppend {
+    fn next_offset(self) -> u64 {
+        match self {
+            Self::Committed { next_offset } | Self::VerifiedDuplicate { next_offset } => {
+                next_offset
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 enum AppendFailure {
     DefinitelyRejected {
@@ -313,6 +324,8 @@ struct InitializationFailure {
 struct RoomActor {
     room_id: String,
     stream: String,
+    active_delta_generation: GenerationId,
+    active_delta_end_offset: u64,
     store: Arc<dyn UrsulaStore>,
     producer_id: String,
     producer_sequence: u64,
@@ -362,6 +375,8 @@ impl RoomActor {
         Self {
             room_id,
             stream,
+            active_delta_generation: GenerationId::ZERO,
+            active_delta_end_offset: 0,
             store,
             producer_id,
             producer_sequence: 0,
@@ -447,6 +462,11 @@ impl RoomActor {
         let observation = observation.map_err(initialization_store_failure)?;
         self.recovery_read_requests = observation.request_count;
         let bytes = observation.bytes;
+        self.active_delta_end_offset =
+            u64::try_from(bytes.len()).map_err(|_| InitializationFailure {
+                state: RoomLifecycle::Corrupt,
+                message: "delta stream length does not fit u64".into(),
+            })?;
         let decode_started = Instant::now();
         let frames = decode_all_with_limits(&bytes, self.config.frame_limits);
         self.recovery_decode_micros = duration_micros(decode_started.elapsed());
@@ -709,6 +729,7 @@ impl RoomActor {
                 #[cfg(feature = "crash-injection")]
                 crash_after_commit_for_test();
                 self.producer_sequence = next_producer_sequence;
+                self.active_delta_end_offset = proof.next_offset();
                 self.history = candidate_history;
                 self.doc = candidate;
                 self.transition(RoomLifecycle::Ready, None);
@@ -806,6 +827,8 @@ impl RoomActor {
         loop {
             tracing::info!(
                 stream = %self.stream,
+                active_delta_generation = self.active_delta_generation.value(),
+                active_delta_end_offset = self.active_delta_end_offset,
                 producer_id = %pending.producer.id,
                 producer_epoch = pending.producer.epoch,
                 producer_sequence = pending.producer.sequence,

@@ -5,6 +5,7 @@
 
 pub mod actor;
 pub mod checkpoint;
+pub mod checkpoint_store;
 pub mod exact_append;
 pub mod frame;
 pub mod manifest;

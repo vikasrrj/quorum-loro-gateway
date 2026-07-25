@@ -34,6 +34,7 @@ use crate::names::producer_id;
 use crate::names::producer_id_for_generation;
 use crate::recovery::RecoveryError;
 use crate::recovery::recover_from_manifest;
+use crate::rotation::rotate_room;
 use crate::ursula::AppendOutcome;
 use crate::ursula::RejectionKind;
 use crate::ursula::StoreError;
@@ -262,6 +263,15 @@ impl RoomHandle {
         }
         result.await.unwrap_or(false)
     }
+    pub async fn rotate(&self) -> bool {
+        let (response, result) = oneshot::channel();
+
+        if self.tx.send(Command::Rotate { response }).await.is_err() {
+            return false;
+        }
+
+        result.await.unwrap_or(false)
+    }
 }
 
 enum Command {
@@ -284,6 +294,9 @@ enum Command {
     },
     WaitForActivation {
         response: oneshot::Sender<()>,
+    },
+    Rotate {
+        response: oneshot::Sender<bool>,
     },
 }
 
@@ -416,6 +429,10 @@ impl RoomActor {
                 }
                 Command::RetryAmbiguous { response } => {
                     let _ = response.send(self.retry_pending().await);
+                }
+                Command::Rotate { response } => {
+                    let rotated = self.rotate_generation().await;
+                    let _ = response.send(rotated);
                 }
                 command
                     if matches!(
@@ -566,6 +583,9 @@ impl RoomActor {
             .as_deref()
             .unwrap_or_else(|| self.lifecycle.as_str());
         match command {
+            Command::Rotate { response } => {
+                let _ = response.send(false);
+            }
             Command::Join { peer, .. } => {
                 send_protocol(
                     &peer,
@@ -586,6 +606,7 @@ impl RoomActor {
             Command::RetryAmbiguous { response } => {
                 let _ = response.send(false);
             }
+
             Command::WaitForActivation { response } => {
                 let _ = response.send(());
             }
@@ -825,6 +846,53 @@ impl RoomActor {
                 send_room_error(&peer, &self.room_id, message);
             }
         }
+    }
+
+    async fn rotate_generation(&mut self) -> bool {
+        if self.lifecycle != RoomLifecycle::Ready || self.blocked.is_some() {
+            return false;
+        }
+
+        let rotated = match rotate_room(
+            self.store.as_ref(),
+            &self.room_id,
+            self.active_delta_generation,
+            self.active_delta_end_offset,
+            &self.doc,
+            &self.history,
+            self.config.ambiguous_retries,
+        )
+        .await
+        {
+            Ok(rotated) => rotated,
+            Err(error) => {
+                self.transition(RoomLifecycle::Unavailable, Some(error.to_string()));
+
+                return false;
+            }
+        };
+
+        self.stream = rotated.next_delta_stream;
+        self.active_delta_generation = rotated.next_delta_generation;
+        self.active_delta_end_offset = 0;
+
+        self.producer_id =
+            producer_id_for_generation(&self.boot_id, &self.room_id, self.active_delta_generation);
+
+        self.producer_sequence = 0;
+        self.history = rotated.retained_history;
+
+        tracing::info!(
+            room = %self.room_id,
+            stream = %self.stream,
+            active_delta_generation =
+                self.active_delta_generation.value(),
+            "room rotation completed"
+        );
+
+        self.transition(RoomLifecycle::Ready, None);
+
+        true
     }
 
     async fn retry_pending(&mut self) -> bool {

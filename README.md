@@ -1,144 +1,129 @@
 # Quorum Loro Gateway
 
-A Loro sync server that stores updates in Ursula and sends `Ack(Ok)` only after the exact update bytes are durably committed.
+A Rust gateway that connects the official Loro sync protocol to Ursula.
 
-This is a working prototype, not a production service yet.
+The gateway sends `Ack(Ok)` only after the exact update bytes are committed to Ursula or an uncertain retry is found and verified byte-for-byte.
 
-**Current version: `v0.1.0`**
+## Why this project exists
 
-## What it does
+The original gateway recovered a room by replaying its complete Ursula delta stream from offset zero.
 
-```text
-Loro client
-    │ WebSocket
-    ▼
-Quorum Loro Gateway
-    │ append exact update bytes
-    ▼
-Ursula durable stream
-    │ quorum commit
-    ▼
-Ack(Ok)
-```
+That recovery method is correct, but the amount of data and work grows with the room’s entire history.
 
-Loro handles CRDT merging and offline edits. Ursula handles durable ordering, replication, and replay. The gateway sits between them and controls when a client update is acknowledged.
-
-## What works
-
-- Official Loro Synchronization Protocol v1 over WebSocket
-- `%LOR` rooms
-- Rust and TypeScript client interoperability
-- Normal and fragmented updates
-- Exact Loro bytes stored in versioned, checksummed frames
-- `Ack(Ok)` only after a commit or a byte-verified duplicate commit
-- Safe retry after a lost Ursula response
-- Full room recovery after a gateway restart
-- Recovery after a commit succeeds but the client ACK is lost
-- Corrupt, truncated, or malformed history is rejected
-- Ursula leader redirects
-- Three-voter tests covering one-voter failure, leader failure, and quorum loss
-- `/healthz` and payload-free room diagnostics at `/debug/rooms`
-
-The gateway keeps no local durable database. A fresh process rebuilds room state from Ursula.
-
-## What `Ack(Ok)` means
-
-`Ack(Ok)` means Ursula committed the frame, or Ursula recognized a retry and the gateway read the stored frame back and verified it byte-for-byte.
-
-Timeouts, transport errors, malformed responses, and unresolved writes never turn into a successful ACK. When a write is ambiguous, the room stops accepting joins and updates until the exact append is resolved.
-
-## Run locally
-
-Start Ursula on `127.0.0.1:4437`, then run:
-
-```bash
-cargo run -- \
-  --listen 127.0.0.1:8080 \
-  --ursula-url http://127.0.0.1:4437
-```
-
-Connect a protocol v1 client to:
+This project adds bounded recovery using:
 
 ```text
-ws://127.0.0.1:8080/ws
+manifest → checkpoint → active delta generation
 ```
 
-For a multi-node Ursula cluster, pass each possible redirect target with `--ursula-peer-url`.
+A restart now restores the latest checkpoint and replays only the current active delta.
 
-## Checks
+## Write flow
 
-```bash
-cargo fmt --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace
+```text
+Loro client update
+        ↓
+room actor validates the update
+        ↓
+exact DeltaFrame is encoded
+        ↓
+frame is appended to Ursula
+        ↓
+commit or exact duplicate is verified
+        ↓
+Ack(Ok) is returned
 ```
 
-Real-cluster, crash-injection, benchmark, and TypeScript tests are ignored by default because they need extra processes or dependencies. See [Testing](docs/TESTING.md).
-
-## Replay cost
-
-Rooms currently rebuild by replaying their full Ursula stream.
-
-| Updates | Encoded history | p95 activation |
-| ---: | ---: | ---: |
-| 10,000 | 1.94 MiB | 237 ms |
-| 50,000 | 9.78 MiB | 912 ms |
-| 100,000 | 19.61 MiB | 1.90 s |
-| 250,000 | 49.08 MiB | 4.82 s |
-
-The measured curve was close to linear for this workload. More detail is in [Benchmarks](docs/BENCHMARKS.md).
-
-## Still missing
-
-- Checkpoints and bounded recovery
-- Stream generations and rotation
-- Retention and cleanup
-- Authentication and authorization
-- Safe multi-gateway writing
-- Cross-gateway live fan-out
-- Actor eviction and slow-client queue limits
-- Recovery from complete Ursula cluster loss
-
-The next major piece is checkpointed recovery, likely starting around 40,000 updates or 8 MiB of post-checkpoint history for the measured workload. That threshold is provisional and must be re-measured on real deployment hardware.
-
-## Docs
-
-- [Design](docs/DESIGN.md)
-- [Testing](docs/TESTING.md)
-- [Benchmarks](docs/BENCHMARKS.md)
+Ambiguous append results do not return success until the gateway verifies that the stored bytes exactly match the original frame.
 
 ## Bounded recovery
 
-The gateway now supports generation-based bounded recovery.
-
-For every accepted Loro batch, `Ack(Ok)` is sent only after the exact encoded
-frame commits to Ursula or an ambiguous retry is located and verified
-byte-for-byte.
-
-Rooms use:
+Each room uses:
 
 ```text
-manifest -> immutable checkpoint -> active delta generation
+manifest
+checkpoint/{generation}
+delta/{generation}
 ```
 
-Rotation checkpoints the current document, preserves exact causally pending
-update blobs, creates a new empty delta generation, publishes a chained manifest
-record, and only then switches the room actor to the new stream.
+A checkpoint contains:
 
-On restart, rooms with a manifest restore the latest checkpoint and replay only
-the active delta generation. Rooms without a manifest retain legacy full-replay
-compatibility through delta generation zero.
+* The current Loro snapshot
+* The source delta generation and offset
+* Exact raw updates that are still causally pending
+* Digest, checksum, and length validation
 
-Automatic rotation defaults to:
+The manifest records:
 
-- 64 MiB active-delta bytes
-- 10,000 active-delta update blobs
-- 15 minutes of active-generation age
+* The latest checkpoint generation
+* The checkpoint digest and length
+* The active delta generation
+* A digest link to the previous manifest record
 
-See [`docs/BOUNDED_RECOVERY.md`](docs/BOUNDED_RECOVERY.md) for the complete
-write, rotation, recovery, corruption, and crash semantics.
+On restart, the gateway:
 
-Run deterministic verification:
+1. Reads and validates the manifest
+2. Loads the referenced checkpoint
+3. Restores the snapshot and pending updates
+4. Replays only the active delta generation
+
+Rooms without a manifest continue using the legacy full-replay path.
+
+## Rotation
+
+Rotation is serialized through the room actor.
+
+The gateway:
+
+1. Builds an immutable checkpoint
+2. Creates the next empty delta generation
+3. Publishes the next manifest record
+4. Switches the actor to the new delta stream
+
+The manifest is published before the in-memory switch, so it remains the durable source of truth after a restart.
+
+Rotation is currently triggered manually through `RoomHandle::rotate()`.
+
+## Benchmark
+
+An in-memory benchmark compared full replay with bounded recovery.
+
+```text
+Total updates:                 2,000
+Checkpointed updates:         1,950
+Active updates replayed:         50
+
+Legacy delta bytes:         395,679
+Active delta bytes:           9,900
+
+Legacy replay time:          261.48 ms
+Bounded recovery time:         8.13 ms
+```
+
+This benchmark is not an Ursula cluster performance result. It demonstrates that active-delta replay depends on the current generation rather than the room’s complete update history.
+
+Run it with:
+
+```bash
+cargo test --test bounded_recovery_benchmark \
+  -- --ignored --nocapture
+```
+
+## Correctness properties
+
+The prototype focuses on these guarantees:
+
+* `Ack(Ok)` is returned only after durable commit or exact duplicate verification
+* Ambiguous retries reuse the same producer tuple and exact frame bytes
+* Checkpoint, manifest, and delta corruption fail closed
+* Stream and generation names are never reused
+* Causally pending Loro updates are retained across checkpoints
+* Legacy rooms remain compatible
+* Rotation is serialized with room writes
+
+## Testing
+
+Run the deterministic test suite:
 
 ```bash
 cargo fmt --all -- --check
@@ -146,10 +131,36 @@ cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-Run the ignored in-memory comparison benchmark:
+The repository includes tests for:
 
-```bash
-cargo test --test bounded_recovery_benchmark \
-  -- --ignored --nocapture
-```
+* Durable acknowledgements
+* Ambiguous and duplicate append outcomes
+* Gateway restart recovery
+* Corrupt frames, checkpoints, and manifests
+* Pending Loro updates
+* Checkpoint creation
+* Manifest chaining
+* Generation rotation
+* Official protocol compatibility
 
+Some Ursula cluster and TypeScript interoperability tests are ignored unless their external dependencies are available.
+
+## Scope
+
+This is a database and distributed-systems research prototype, not a production service.
+
+It intentionally does not include:
+
+* Multiple active gateway writers for one room
+* Distributed leases or fencing
+* Authentication and authorization
+* Old-generation garbage collection
+* Manifest compaction
+* Automatic background rotation
+* Production Ursula cluster benchmarks
+
+The goal is to demonstrate a correct durable acknowledgement boundary and a practical checkpoint-and-generation design for bounded Loro recovery.
+
+## License
+
+Apache-2.0

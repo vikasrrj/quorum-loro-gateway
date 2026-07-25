@@ -1,46 +1,75 @@
 # Quorum Loro Gateway
 
-Quorum Loro Gateway is a Rust prototype that connects the official Loro sync protocol with Ursula.
+A Rust gateway between the official Loro sync protocol and Ursula.
 
-The main guarantee is simple: the gateway sends `Ack(Ok)` only after the exact update has been committed to Ursula or an uncertain retry has been verified against the stored bytes.
+The gateway accepts Loro document updates, stores the exact update bytes in Ursula, and returns `Ack(Ok)` only after the append is committed or an uncertain retry is verified byte for byte.
 
-## Why I built it
+## Overview
 
-The original recovery flow replayed the complete update history every time a room restarted.
+Each room is handled by a single actor.
 
-That works, but recovery becomes slower as the room grows.
+The actor serializes updates, retries, joins, recovery, and stream rotation for that room.
 
-This project adds bounded recovery using:
+Updates are stored inside versioned `DeltaFrame` records containing the original Loro update bytes, batch ID, producer tuple, digest, checksum, and encoded length.
+
+## Write Guarantee
+
+```text
+Loro update
+    ↓
+validate update
+    ↓
+encode DeltaFrame
+    ↓
+append to Ursula
+    ↓
+commit or exact duplicate verification
+    ↓
+Ack(Ok)
+```
+
+An ambiguous append does not return success.
+
+The gateway retries using the same producer identity, sequence, stream, and frame bytes.
+
+When Ursula reports a duplicate, the stored range must exactly match the original frame before the gateway returns `Ack(Ok)`.
+
+## Recovery
+
+Rooms without a manifest use the original full replay path.
+
+Rooms with checkpoints recover using:
 
 ```text
 manifest → checkpoint → active delta
 ```
 
-The gateway can now restore the latest checkpoint and replay only the current delta generation.
+The checkpoint restores the Loro document state and retains exact update blobs that are still causally pending.
 
-## How it works
+The active delta contains updates committed after the latest checkpoint.
 
-A client update is validated, encoded into a durable frame, and appended to Ursula.
+## Rotation
 
-If the result is uncertain, the gateway retries using the same producer identity and verifies that the stored bytes match before returning success.
+Rotation creates an immutable checkpoint, creates the next delta generation, publishes a new manifest record, and then switches the room actor to the new stream.
 
-During rotation, the gateway creates a checkpoint, creates the next delta generation, publishes a manifest record, and switches the room to the new stream.
+Generation names are never reused.
 
-Rotation is currently triggered manually through `RoomHandle::rotate()`.
+Rotation is currently triggered through `RoomHandle::rotate()`.
 
 ## Benchmark
 
-A small in memory benchmark used 2,000 updates.
+The included benchmark compares complete history replay with checkpoint recovery.
 
-```text
-Full replay:        261.48 ms
-Bounded recovery:     8.13 ms
+| Measurement            | Full replay | Checkpoint recovery |
+| ---------------------- | ----------: | ------------------: |
+| Total document updates |       2,000 |               2,000 |
+| Updates replayed       |       2,000 |                  50 |
+| Delta bytes replayed   |     395,679 |               9,900 |
+| Recovery time          |   261.48 ms |             8.13 ms |
 
-Full delta:        395,679 bytes
-Active delta:        9,900 bytes
-```
+The remaining 1,950 updates are represented by the checkpoint.
 
-The benchmark is not a real Ursula cluster benchmark. It only shows that restart replay depends on the active generation instead of the complete room history.
+This is an in-memory comparison benchmark and not a production Ursula cluster benchmark.
 
 Run it with:
 
@@ -48,6 +77,16 @@ Run it with:
 cargo test --test bounded_recovery_benchmark \
   -- --ignored --nocapture
 ```
+
+## Running
+
+```bash
+cargo run
+```
+
+The gateway connects Loro protocol clients to the configured Ursula server.
+
+Health and room status endpoints are available for inspecting gateway state without exposing document contents.
 
 ## Testing
 
@@ -57,14 +96,18 @@ cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
+The tests cover durable acknowledgements, ambiguous append outcomes, exact duplicate verification, gateway restart recovery, pending Loro updates, corrupt frames, checkpoints, manifests, protocol limits, and generation rotation.
+
+Some Ursula cluster and TypeScript interoperability tests require external dependencies and remain ignored by default.
+
 ## Scope
 
-This is a small database and distributed systems prototype, not a production service.
+This is a small database and distributed systems prototype.
 
-It does not include multiple active gateway writers, distributed leases, authentication, old generation cleanup, automatic background rotation, or production cluster benchmarks.
+It currently assumes one active gateway writer for each room.
 
-The goal was to explore durable acknowledgements, safe retries, checkpoints, manifests, stream generations, and bounded recovery without turning it into a much larger system.
+Multi-gateway coordination, distributed writer fencing, authentication, automatic rotation, old-generation cleanup, manifest compaction, and production cluster benchmarks are outside the current scope.
 
 ## License
 
-Apache 2.0
+Apache-2.0

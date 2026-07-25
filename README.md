@@ -1,97 +1,70 @@
-Quorum Loro Gateway
+# Quorum Loro Gateway
 
-A Rust gateway connecting the official Loro sync protocol to Ursula.
+Quorum Loro Gateway is a Rust prototype that connects the official Loro sync protocol with Ursula.
 
-The gateway sends Ack(Ok) only after the exact update bytes are committed to Ursula, or after an uncertain retry is verified byte for byte against what's actually stored.
+The main guarantee is simple: the gateway sends `Ack(Ok)` only after the exact update has been committed to Ursula or an uncertain retry has been verified against the stored bytes.
 
-Why this exists
+## Why I built it
 
-#why-this-exists
+The original recovery flow replayed the complete update history every time a room restarted.
 
-The original gateway recovered a room by replaying its entire Ursula delta stream from offset zero. That's correct, but the work grows with the room's full history, forever.
+That works, but recovery becomes slower as the room grows.
 
-This project fixes that with bounded recovery: manifest → checkpoint → active delta generation. A restart now loads the latest checkpoint and replays only the current generation, not everything that ever happened.
+This project adds bounded recovery using:
 
-How a write actually flows
+```text
+manifest → checkpoint → active delta
+```
 
-#how-a-write-actually-flows
+The gateway can now restore the latest checkpoint and replay only the current delta generation.
 
-loro client update
-        ↓
-room actor validates it
-        ↓
-exact delta frame gets encoded
-        ↓
-frame appended to ursula
-        ↓
-commit or exact duplicate is verified
-        ↓
-ack(ok)
+## How it works
 
-If an append result is ever ambiguous, the gateway never returns success until it's confirmed the stored bytes match the original frame exactly. No guessing.
+A client update is validated, encoded into a durable frame, and appended to Ursula.
 
-Bounded recovery
+If the result is uncertain, the gateway retries using the same producer identity and verifies that the stored bytes match before returning success.
 
-#bounded-recovery
+During rotation, the gateway creates a checkpoint, creates the next delta generation, publishes a manifest record, and switches the room to the new stream.
 
-Each room has three streams: manifest, checkpoint/{generation}, delta/{generation}.
+Rotation is currently triggered manually through `RoomHandle::rotate()`.
 
-A checkpoint holds the current Loro snapshot, the source delta generation and offset, any raw updates still causally pending, and a digest, checksum, and length for validation.
+## Benchmark
 
-The manifest tracks the latest checkpoint generation, its digest and length, the active delta generation, and a digest link back to the previous manifest record.
+A small in memory benchmark used 2,000 updates.
 
-On restart, the gateway reads and validates the manifest, loads the checkpoint it points to, restores the snapshot plus pending updates, and replays only the active generation forward. Rooms without a manifest just keep using the old full-replay path, so nothing older breaks.
+```text
+Full replay:        261.48 ms
+Bounded recovery:     8.13 ms
 
-Rotation
+Full delta:        395,679 bytes
+Active delta:        9,900 bytes
+```
 
-#rotation
+The benchmark is not a real Ursula cluster benchmark. It only shows that restart replay depends on the active generation instead of the complete room history.
 
-Rotation is serialized through the room actor. When it happens, the gateway builds an immutable checkpoint, creates the next empty delta generation, publishes the new manifest record, then switches over. The manifest is published before the in-memory switch, so it stays the true source of record even across a crash mid-rotation.
+Run it with:
 
-Right now rotation is manual, triggered through RoomHandle::rotate().
+```bash
+cargo test --test bounded_recovery_benchmark \
+  -- --ignored --nocapture
+```
 
-Benchmark
+## Testing
 
-#benchmark
-
-An in-memory comparison of full replay versus bounded recovery, on 2,000 updates:
-
-Metric	Legacy (full replay)	Bounded recovery
-Updates covered	1,950 checkpointed	50 active
-Delta bytes	395,679	9,900
-Recovery time	261.48 ms	8.13 ms
-
-This isn't a real Ursula cluster benchmark, just proof that recovery cost now scales with the active generation, not the room's whole history.
-
-Run it yourself:
-
-cargo test --test bounded_recovery_benchmark -- --ignored --nocapture
-What it actually guarantees
-
-#what-it-actually-guarantees
-
-Ack(Ok) only comes after a durable commit or an exact duplicate verification. Ambiguous retries always reuse the same producer tuple and exact frame bytes. Corrupt checkpoints, manifests, or deltas fail closed rather than silently proceeding. Stream and generation names are never reused. Causally pending Loro updates survive across checkpoints. Old rooms stay compatible. Rotation is fully serialized with regular writes.
-
-Testing
-
-#testing
-
+```bash
 cargo fmt --all -- --check
 cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+```
 
-Covers durable acks, ambiguous and duplicate appends, gateway restart recovery, corrupted frames/checkpoints/manifests, pending Loro updates, checkpoint creation, manifest chaining, generation rotation, and official protocol compatibility. A few Ursula cluster and TypeScript interop tests are skipped unless their external dependencies are available.
+## Scope
 
-Scope
+This is a small database and distributed systems prototype, not a production service.
 
-#scope
+It does not include multiple active gateway writers, distributed leases, authentication, old generation cleanup, automatic background rotation, or production cluster benchmarks.
 
-This is a distributed systems research prototype, not a production service. On purpose, it doesn't include multiple active writers per room, distributed leases or fencing, auth, old generation cleanup, manifest compaction, automatic rotation, or real cluster benchmarks.
+The goal was to explore durable acknowledgements, safe retries, checkpoints, manifests, stream generations, and bounded recovery without turning it into a much larger system.
 
-The goal was narrower than all that: prove a correct durable acknowledgement boundary, and a practical checkpoint plus generation design for bounded Loro recovery.
-
-License
-
-#license
+## License
 
 Apache 2.0

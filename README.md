@@ -106,3 +106,50 @@ The next major piece is checkpointed recovery, likely starting around 40,000 upd
 - [Design](docs/DESIGN.md)
 - [Testing](docs/TESTING.md)
 - [Benchmarks](docs/BENCHMARKS.md)
+
+## Bounded recovery
+
+The gateway now supports generation-based bounded recovery.
+
+For every accepted Loro batch, `Ack(Ok)` is sent only after the exact encoded
+frame commits to Ursula or an ambiguous retry is located and verified
+byte-for-byte.
+
+Rooms use:
+
+```text
+manifest -> immutable checkpoint -> active delta generation
+```
+
+Rotation checkpoints the current document, preserves exact causally pending
+update blobs, creates a new empty delta generation, publishes a chained manifest
+record, and only then switches the room actor to the new stream.
+
+On restart, rooms with a manifest restore the latest checkpoint and replay only
+the active delta generation. Rooms without a manifest retain legacy full-replay
+compatibility through delta generation zero.
+
+Automatic rotation defaults to:
+
+- 64 MiB active-delta bytes
+- 10,000 active-delta update blobs
+- 15 minutes of active-generation age
+
+See [`docs/BOUNDED_RECOVERY.md`](docs/BOUNDED_RECOVERY.md) for the complete
+write, rotation, recovery, corruption, and crash semantics.
+
+Run deterministic verification:
+
+```bash
+cargo fmt --all -- --check
+cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+```
+
+Run the ignored in-memory comparison benchmark:
+
+```bash
+cargo test --test bounded_recovery_benchmark \
+  -- --ignored --nocapture
+```
+

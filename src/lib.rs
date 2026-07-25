@@ -9,6 +9,7 @@ pub mod checkpoint_store;
 pub mod exact_append;
 pub mod frame;
 pub mod manifest;
+pub mod manifest_store;
 pub mod names;
 pub mod protocol;
 pub mod server;

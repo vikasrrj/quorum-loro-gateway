@@ -31,6 +31,9 @@ use crate::frame::decode_all_with_limits;
 use crate::names::GenerationId;
 use crate::names::delta_stream;
 use crate::names::producer_id;
+use crate::names::producer_id_for_generation;
+use crate::recovery::RecoveryError;
+use crate::recovery::recover_from_manifest;
 use crate::ursula::AppendOutcome;
 use crate::ursula::RejectionKind;
 use crate::ursula::StoreError;
@@ -324,6 +327,7 @@ struct InitializationFailure {
 
 struct RoomActor {
     room_id: String,
+    boot_id: [u8; 16],
     stream: String,
     active_delta_generation: GenerationId,
     active_delta_end_offset: u64,
@@ -375,6 +379,7 @@ impl RoomActor {
         }));
         Self {
             room_id,
+            boot_id,
             stream,
             active_delta_generation: GenerationId::ZERO,
             active_delta_end_offset: 0,
@@ -445,14 +450,65 @@ impl RoomActor {
 
     async fn initialize(&mut self) -> Result<(), InitializationFailure> {
         let started = Instant::now();
-        self.store
-            .ensure_stream(&self.stream)
+
+        match recover_from_manifest(self.store.as_ref(), &self.room_id, self.config.frame_limits)
             .await
-            .map_err(initialization_store_failure)?;
-        let (history, doc) = self.load_from_store().await?;
-        self.history = history;
-        self.doc = doc;
+            .map_err(manifest_recovery_failure)?
+        {
+            Some(recovered) => {
+                self.stream = recovered.active_delta_stream;
+                self.active_delta_generation = recovered.active_delta_generation;
+                self.active_delta_end_offset = recovered.active_delta_end_offset;
+
+                self.producer_id = producer_id_for_generation(
+                    &self.boot_id,
+                    &self.room_id,
+                    self.active_delta_generation,
+                );
+                self.producer_sequence = 0;
+
+                self.history = recovered.history;
+                self.doc = recovered.doc;
+
+                self.recovered_stream_bytes = recovered
+                    .recovered_checkpoint_bytes
+                    .saturating_add(recovered.recovered_delta_bytes);
+
+                self.recovered_update_count = self.history.len();
+                self.recovery_read_requests = 3;
+
+                tracing::info!(
+                    room = %self.room_id,
+                    stream = %self.stream,
+                    checkpoint_generation =
+                        recovered.checkpoint_generation.value(),
+                    active_delta_generation =
+                        self.active_delta_generation.value(),
+                    active_delta_end_offset =
+                        self.active_delta_end_offset,
+                    "room recovered from checkpoint manifest"
+                );
+            }
+            None => {
+                self.store
+                    .ensure_stream(&self.stream)
+                    .await
+                    .map_err(initialization_store_failure)?;
+
+                let (history, doc) = self.load_from_store().await?;
+                self.history = history;
+                self.doc = doc;
+
+                tracing::info!(
+                    room = %self.room_id,
+                    stream = %self.stream,
+                    "room recovered through legacy full replay"
+                );
+            }
+        }
+
         self.recovery_total_micros = duration_micros(started.elapsed());
+
         Ok(())
     }
 
@@ -558,6 +614,9 @@ impl RoomActor {
             .status
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        status.stream.clone_from(&self.stream);
+        status.producer_id.clone_from(&self.producer_id);
         status.state = self.lifecycle;
         status.producer_sequence = self.producer_sequence;
         status.pending_sequence = self
@@ -955,6 +1014,18 @@ fn initialization_store_failure(error: StoreError) -> InitializationFailure {
     } else {
         RoomLifecycle::Unavailable
     };
+    InitializationFailure {
+        state,
+        message: error.to_string(),
+    }
+}
+fn manifest_recovery_failure(error: RecoveryError) -> InitializationFailure {
+    let state = match &error {
+        RecoveryError::Store(StoreError::Integrity(_)) => RoomLifecycle::Corrupt,
+        RecoveryError::Store(_) => RoomLifecycle::Unavailable,
+        _ => RoomLifecycle::Corrupt,
+    };
+
     InitializationFailure {
         state,
         message: error.to_string(),

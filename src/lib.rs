@@ -5,6 +5,7 @@
 
 pub mod actor;
 pub mod checkpoint;
+pub mod exact_append;
 pub mod frame;
 pub mod manifest;
 pub mod names;
